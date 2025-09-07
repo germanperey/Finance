@@ -291,22 +291,26 @@ async def mp_create_preference(payload: Dict[str, str]):
             "currency_id": settings.MP_CURRENCY,
             "unit_price": float(settings.MP_PRICE_1DAY),
         }],
+        "payer": {"email": gmail},                   # ← IMPORTANTE
         "back_urls": {
             "success": f"{settings.BASE_URL}/mp/return",
             "failure": f"{settings.BASE_URL}/mp/return",
             "pending": f"{settings.BASE_URL}/mp/return",
         },
         "auto_return": "approved",
+        "purpose": "wallet_purchase",
         "metadata": {"gmail": gmail, "nombre": nombre, "apellido": apellido},
         "external_reference": hashlib.sha1(gmail.encode()).hexdigest(),
-        # "notification_url": f"{settings.BASE_URL}/mp/webhook",  # si luego usas webhooks
     }
     try:
-        res = mp.preference().create(preference)
-        pref = res["response"]
-        return {"id": pref.get("id"), "init_point": pref.get("init_point") or pref.get("sandbox_init_point")}
+        pref = mp.preference().create(preference)["response"]
+        return {
+            "id": pref.get("id"),
+            "init_point": pref.get("init_point") or pref.get("sandbox_init_point"),
+        }
     except Exception as e:
         raise HTTPException(500, f"Mercado Pago error: {e}")
+
 
 @app.get("/mp/return", response_class=HTMLResponse)
 async def mp_return(status: str | None = None, payment_id: str | None = None, collection_id: str | None = None):

@@ -8,8 +8,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # copia TODO (incluye templates/, static/, etc.)
 COPY . .
 
-# Render provee PORT => no lo fijes, solo expón opcionalmente
+# Render provee PORT
 EXPOSE 10000
 
-# si tu archivo es app.py y el objeto se llama app → app:app
-CMD ["bash","-lc","gunicorn app:app --bind 0.0.0.0:${PORT}"]
+# FastAPI con Gunicorn + worker Uvicorn
+CMD ["bash","-lc","gunicorn -k uvicorn.workers.UvicornWorker -w 2 -t 120 app:app --bind 0.0.0.0:${PORT}"]
