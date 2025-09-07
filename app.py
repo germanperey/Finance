@@ -55,6 +55,9 @@ class Settings(BaseSettings):
     MIN_CHARS: int = 200
     TOP_K: int = 6
     NORMALIZE: bool = True
+    MAX_UPLOAD_FILES: int = 5
+    SINGLE_FILE_MAX_MB: int = 20
+    MAX_TOTAL_MB: int = 100
 
     class Config:
         env_file = ".env"
@@ -278,92 +281,120 @@ async function startCheckout(ev){
 </html>"""
 
 
-PORTAL_HTML = """
+PORTAL_HTML = f"""
 <!doctype html><html lang=es><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Portal</title>
-<style>body{font-family:system-ui;margin:2rem} .card{max-width:1000px;margin:auto;padding:1.2rem 1.5rem;border:1px solid #e5e7eb;border-radius:14px;box-shadow:0 10px 30px rgba(0,0,0,.06)} input,button,textarea{padding:.6rem .8rem;border-radius:10px;border:1px solid #d1d5db;width:100%} button{background:#111;color:#fff;border:none;cursor:pointer} pre{white-space:pre-wrap;background:#f9fafb;padding:1rem;border-radius:10px;border:1px solid #eee} .row{display:flex;gap:12px;flex-wrap:wrap}</style>
+<style>
+  body{font-family:system-ui;margin:2rem}
+  .card{max-width:1000px;margin:auto;padding:1.2rem 1.5rem;border:1px solid #e5e7eb;border-radius:14px;box-shadow:0 10px 30px rgba(0,0,0,.06)}
+  input,button,textarea{padding:.6rem .8rem;border-radius:10px;border:1px solid #d1d5db;width:100%}
+  button{background:#111;color:#fff;border:none;cursor:pointer}
+  pre{white-space:pre-wrap;background:#f9fafb;padding:1rem;border-radius:10px;border:1px solid #eee}
+  .row{display:flex;gap:12px;flex-wrap:wrap}
+  small{color:#6b7280}
+</style>
 </head><body>
 <div class=card>
-<h2>Portal de usuario (pase activo)</h2>
-<form id=up method=post enctype=multipart/form-data>
-  <input type=file name=files multiple accept=application/pdf required>
-  <div style="margin-top:8px"><button>Subir PDFs e indexar</button></div>
-</form>
-<pre id=upres></pre>
-<hr>
-<form id=askf>
-  <input name=q placeholder="Tu pregunta" required>
-  <div style="margin-top:8px"><button>Preguntar</button></div>
-</form>
-<pre id=askres></pre>
-<hr>
-<form id=rep>
-  <input name=periodo placeholder="Periodo (opcional)">
-  <div style="margin-top:8px"><button>Generar Reporte Automático</button></div>
-</form>
-<pre id=repres></pre>
+  <h2>Portal de usuario (pase activo)</h2>
+
+  <!-- SUBIR PDFs -->
+  <form id=up method=post enctype=multipart/form-data>
+    <input type=file name=files multiple accept=application/pdf required>
+    <div style="margin-top:8px"><button>Subir PDFs e indexar</button></div>
+  </form>
+  <small>Máximo {settings.MAX_UPLOAD_FILES} PDF por subida. Límite: {settings.SINGLE_FILE_MAX_MB} MB c/u y {settings.MAX_TOTAL_MB} MB en total.</small>
+  <pre id=upres></pre>
+
+  <hr>
+
+  <!-- PREGUNTAR (hasta 5) -->
+  <form id=askf>
+    <textarea name=questions rows="4" placeholder="Escribe hasta 5 preguntas, una por línea"></textarea>
+    <div style="margin-top:8px"><button>Preguntar</button></div>
+  </form>
+  <small>Puedes hacer hasta 5 preguntas a la vez (una por línea).</small>
+  <pre id=askres></pre>
+
+  <hr>
+
+  <!-- REPORTE -->
+  <form id=rep>
+    <input name=periodo placeholder="Período (opcional)">
+    <small>Ejemplos: “2022–2025”, “enero–junio 2024”, “últimos 12 meses”.</small>
+    <div style="margin-top:8px"><button>Generar Reporte Automático</button></div>
+  </form>
+  <pre id=repres></pre>
 </div>
+
 <script>
-async function withToken(url, opts = {}) {
-  const t = localStorage.getItem('token') || '';
-  opts.headers = Object.assign({'Authorization': 'Bearer ' + t}, opts.headers || {});
-  return fetch(url, opts);
+const MAX_FILES = {settings.MAX_UPLOAD_FILES};
+const SINGLE_MAX = {settings.SINGLE_FILE_MAX_MB}; // MB
+const TOTAL_MAX  = {settings.MAX_TOTAL_MB};       // MB
+
+function toMB(n){ return (n/1024/1024).toFixed(1) + " MB"; }
+
+async function withToken(url,opts={{}}){
+  const t=localStorage.getItem('token');
+  opts.headers=Object.assign({'Authorization':'Bearer '+t},opts.headers||{});
+  return fetch(url,opts);
 }
 
-function show(el, text) {
-  el.textContent = (typeof text === 'string') ? text : JSON.stringify(text, null, 2);
-}
-
-// SUBIR PDFs
-up.onsubmit = async (e) => {
+// SUBIR PDFs (con validaciones de cantidad y peso)
+up.onsubmit = async e => {
   e.preventDefault();
-  const fd = new FormData(up);
-  const box = document.getElementById('upres');
-  show(box, 'Subiendo...');
-  try {
-    const r = await withToken('/upload', { method: 'POST', body: fd });
-    const body = await r.text();
-    show(box, `HTTP ${r.status}\n\n${body}`);
-  } catch (err) {
-    show(box, 'ERROR de red: ' + err);
+  const input = up.querySelector('input[type=file]');
+  const files = Array.from(input.files || []);
+  const box   = document.getElementById('upres');
+
+  if (!files.length) { box.textContent = "Selecciona al menos un PDF."; return; }
+  if (files.length > MAX_FILES) { box.textContent = `Máximo ${MAX_FILES} PDFs por subida.`; return; }
+
+  let total = 0;
+  for (const f of files) {
+    total += f.size;
+    if (!/\\.pdf$/i.test(f.name)) { box.textContent = `${f.name}: solo PDF`; return; }
+    if (f.size > SINGLE_MAX*1024*1024) { box.textContent = `${f.name} supera ${SINGLE_MAX} MB`; return; }
   }
+  if (total > TOTAL_MAX*1024*1024) {
+    box.textContent = `Superaste el total permitido (${TOTAL_MAX} MB).`;
+    return;
+  }
+
+  box.textContent = "Subiendo...";
+  const fd = new FormData(up);
+  const r  = await withToken('/upload',{method:'POST',body:fd});
+  box.textContent = `HTTP ${r.status}\\n` + await r.text();
 };
 
-// PREGUNTAR
-askf.onsubmit = async (e) => {
+// PREGUNTAR (hasta 5 preguntas en una sola llamada)
+askf.onsubmit = async e => {
   e.preventDefault();
-  const q   = new FormData(askf).get('q');
-  const box = document.getElementById('askres');
-  show(box, 'Consultando...');
-  try {
-    const r = await withToken('/ask', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ question: q, top_k: 6 })
-    });
-    const body = await r.text();
-    show(box, `HTTP ${r.status}\n\n${body}`);
-  } catch (err) {
-    show(box, 'ERROR de red: ' + err);
-  }
+  const raw  = new FormData(askf).get('questions') || '';
+  const list = raw.split(/\\r?\\n/).map(x=>x.trim()).filter(Boolean).slice(0,5);
+  const box  = document.getElementById('askres');
+
+  if (!list.length) { box.textContent = "Escribe al menos 1 pregunta (una por línea)."; return; }
+
+  box.textContent = "Consultando...";
+  const r = await withToken('/ask',{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({questions: list, top_k: 6})
+  });
+  box.textContent = `HTTP ${r.status}\\n` + await r.text();
 };
 
 // REPORTE
-rep.onsubmit = async (e) => {
+rep.onsubmit = async e => {
   e.preventDefault();
   const periodo = new FormData(rep).get('periodo') || '';
   const box = document.getElementById('repres');
-  show(box, 'Generando...');
-  try {
-    const r = await withToken('/report', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ period: periodo })
-    });
-    const body = await r.text();
-    show(box, `HTTP ${r.status}\n\n${body}`);
-  } catch (err) {
-    show(box, 'ERROR de red: ' + err);
-  }
+  box.textContent = "Generando...";
+  const r = await withToken('/report',{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({period: periodo})
+  });
+  box.textContent = `HTTP ${r.status}\\n` + await r.text();
 };
 </script>
 </body></html>
@@ -486,57 +517,90 @@ async def upload(request: Request, files: Optional[List[UploadFile]] = File(None
     uid = require_user(request)
     base = user_dir(uid); ensure_dirs(base)
 
-    info = {"received": 0, "saved": [], "errors": []}
-    saved_paths: List[Path] = []
+    max_files = settings.MAX_UPLOAD_FILES
+    single_max = settings.SINGLE_FILE_MAX_MB * 1024 * 1024
+    total_max  = settings.MAX_TOTAL_MB * 1024 * 1024
 
-    if not files:
-        return {"message": "no files in request", **info}
+    if not files or len(files) == 0:
+        return {"ok": False, "message": "Selecciona al menos un PDF."}
+    if len(files) > max_files:
+        return {"ok": False, "message": f"Máximo {max_files} PDFs por subida."}
+
+    total_size = 0
+    saved: List[Path] = []
+    errors: List[str] = []
 
     for f in files:
-        try:
-            fn = (f.filename or "archivo.pdf").strip()
-            if not fn.lower().endswith(".pdf"):
-                info["errors"].append({fn: "Solo PDFs"})
-                continue
-            dest = base / "docs" / fn
-            content = await f.read()
-            with open(dest, "wb") as out:
-                out.write(content)
-            info["received"] += 1
-            info["saved"].append(fn)
-            saved_paths.append(dest)
-        except Exception as e:
-            info["errors"].append({f.filename or "archivo": str(e)})
+        fn = (f.filename or "archivo.pdf").strip()
+        if not fn.lower().endswith(".pdf"):
+            errors.append(f"{fn}: solo se aceptan PDF")
+            continue
+        content = await f.read()
+        total_size += len(content)
+        if len(content) > single_max:
+            errors.append(f"{fn}: supera {settings.SINGLE_FILE_MAX_MB} MB")
+            continue
+        dest = base/"docs"/fn
+        with open(dest, "wb") as out:
+            out.write(content)
+        saved.append(dest)
 
-    fragments = add_pdfs_to_index(base, saved_paths)
-    info["fragments_indexed"] = fragments
-    return info
+    if total_size > total_max:
+        # borra los que guardamos en esta pasada si se excedió el total
+        for p in saved:
+            try: p.unlink(missing_ok=True)
+            except: pass
+        return {"ok": False, "message": f"Superaste el total permitido ({settings.MAX_TOTAL_MB} MB por subida)."}
+
+    fragments = add_pdfs_to_index(base, saved) if saved else 0
+    return {"ok": True, "saved": [p.name for p in saved], "fragments_indexed": fragments, "errors": errors}
 
 
 @app.post("/ask")
 async def ask(request: Request, body: Dict[str, Any]):
     uid = require_user(request)
-    q = body.get("question", "")
-    if not q: raise HTTPException(400, "Falta 'question'")
-    res = semantic_search(user_dir(uid), q, settings.TOP_K)
-    if not res:
-        return {"answer": None, "context": [], "message": "Sin documentos indexados"}
-    ctx = [{"score": round(s,3), **m} for s,m in res]
-    answer = "\n\n".join([f"[Fuente: {c['doc_title']} p.{c['page']}]\n{c['text']}" for c in ctx])
-    return {"answer": "Pasajes más relevantes:", "context": ctx, "evidence": answer}
+    base = user_dir(uid)
+    top_k = int(body.get("top_k", settings.TOP_K))
+
+    # Soporta "question" (string) o "questions" (lista)
+    q = body.get("questions") or body.get("question") or []
+    if isinstance(q, str): queries = [q]
+    else: queries = [str(x) for x in q][:5]
+    queries = [x.strip() for x in queries if x and x.strip()]
+
+    if not queries:
+        raise HTTPException(400, "Falta 'questions' o 'question'")
+
+    out = []
+    for query in queries:
+        res = semantic_search(base, query, top_k)
+        ctx = [{"score": round(s,3), **m} for s,m in res]
+        evidence = "\n\n".join([f"[Fuente: {c['doc_title']} p.{c['page']}]\n{c['text']}" for c in ctx])
+        out.append({"question": query, "context": ctx, "evidence": evidence,
+                    "answer": "Pasajes más relevantes (ver 'evidence')."})
+
+    return {"results": out}
 
 # ---- KPI extractor (igual que antes, simplificado) ----
 import re as _re
 LABELS = {
-    "revenue": ["ingresos","ventas","ventas netas"],
-    "cogs": ["costo de ventas"],
-    "gross_profit": ["utilidad bruta"],
-    "operating_income": ["resultado operacional","utilidad de operación"],
-    "net_income": ["utilidad neta","resultado del ejercicio"],
-    "total_assets": ["activos totales"],
-    "total_equity": ["patrimonio"],
-    "total_liabilities": ["pasivos totales"],
+    "revenue": ["ingresos","ventas","ventas netas","ventas totales"],
+    "cogs": ["costo de ventas","coste de ventas","costo de los bienes vendidos"],
+    "gross_profit": ["utilidad bruta","resultado bruto"],
+    "operating_income": ["resultado operacional","utilidad de operación","resultado de explotación","ebit"],
+    "net_income": ["utilidad neta","resultado del ejercicio","ganancia neta"],
+    "total_assets": ["activos totales","total activos"],
+    "total_equity": ["patrimonio","patrimonio neto","capital contable"],
+    "total_liabilities": ["pasivos totales","total pasivos","deudas totales"],
+    "current_assets": ["activos corrientes","activos circulantes"],
+    "current_liabilities": ["pasivos corrientes","pasivos de corto plazo"],
+    "inventory": ["inventario","existencias"],
+    "accounts_receivable": ["cuentas por cobrar","deudores comerciales"],
+    "accounts_payable": ["cuentas por pagar","acreedores comerciales"],
+    "interest_expense": ["gastos financieros","intereses pagados"],
+    "ebitda": ["ebitda"],
 }
+
 NUM = _re.compile(r"[-+]?\d{1,3}(?:[\.,]\d{3})*(?:[\.,]\d+)?")
 
 def _num(s: str):
@@ -549,7 +613,7 @@ def _num(s: str):
     except: return None
 
 def extract_kpis_from_pdfs(pdfs: List[Path]) -> Dict[str, Any]:
-    import pdfplumber  # import aquí
+    import pdfplumber
     values: Dict[str, float] = {}
     for pdf in pdfs:
         try:
@@ -566,38 +630,146 @@ def extract_kpis_from_pdfs(pdfs: List[Path]) -> Dict[str, Any]:
                                         if v is not None: values.setdefault(key, v)
         except Exception:
             continue
+
     out: Dict[str, Any] = {"raw": values}
-    rev = values.get("revenue"); cogs = values.get("cogs")
-    gp = values.get("gross_profit"); op = values.get("operating_income")
-    ni = values.get("net_income"); assets = values.get("total_assets"); eq = values.get("total_equity")
+
+    # Conveniencias
+    rev   = values.get("revenue")
+    cogs  = values.get("cogs")
+    gp    = values.get("gross_profit")
+    op    = values.get("operating_income")
+    ni    = values.get("net_income")
+    assets= values.get("total_assets")
+    eq    = values.get("total_equity")
+    liab  = values.get("total_liabilities")
+    ca    = values.get("current_assets")
+    cl    = values.get("current_liabilities")
+    inv   = values.get("inventory")
+    ar    = values.get("accounts_receivable")
+    ap    = values.get("accounts_payable")
+    intexp= values.get("interest_expense")
+    ebitda= values.get("ebitda")
+
+    # Márgenes
     if rev and cogs: out["gross_margin"]=(rev-cogs)/rev
-    if op and rev: out["operating_margin"]=op/rev
-    if ni and rev: out["net_margin"]=ni/rev
-    if ni and assets: out["ROA"]=ni/assets
-    if ni and eq and eq!=0: out["ROE"]=ni/eq
+    if op and rev:   out["operating_margin"]=op/rev
+    if ni and rev:   out["net_margin"]=ni/rev
+
+    # Liquidez
+    if ca and cl and cl!=0: out["current_ratio"]=ca/cl
+    if ca and inv is not None and cl and cl!=0: out["quick_ratio"]=(ca - inv)/cl
+
+    # Endeudamiento
+    if liab and assets and assets!=0: out["debt_ratio"]=liab/assets
+    if liab and eq and eq!=0:         out["debt_to_equity"]=liab/eq
+    if op and intexp and intexp!=0:   out["interest_coverage"]=op/intexp
+
+    # Rentabilidad
+    if ni and assets and assets!=0: out["ROA"]=ni/assets
+    if ni and eq and eq!=0:         out["ROE"]=ni/eq
+    if rev and assets and assets!=0: out["asset_turnover"]=rev/assets
+
+    # Actividad (días)
+    if rev and ar:    out["days_receivable"]=365*ar/rev
+    if cogs and ap:   out["days_payable"]=365*ap/cogs
+    if cogs and inv:  out["inventory_turnover"]=cogs/max(inv,1e-9)
+
+    # Working capital
+    if ca is not None and cl is not None: out["working_capital"]=ca - cl
+
     return out
+
 
 @app.post("/report")
 async def report(request: Request, body: Dict[str, Any]):
     uid = require_user(request)
     base = user_dir(uid)
     pdfs = list((base/"docs").glob("*.pdf"))
-    if not pdfs: return {"message":"Sube al menos un PDF"}
-    kpis = extract_kpis_from_pdfs(pdfs)
-    analysis = []
-    if "gross_margin" in kpis: analysis.append(f"Margen bruto ~ {kpis['gross_margin']*100:.1f}%")
-    if "operating_margin" in kpis: analysis.append(f"Margen operacional ~ {kpis['operating_margin']*100:.1f}%")
-    if "net_margin" in kpis: analysis.append(f"Margen neto ~ {kpis['net_margin']*100:.1f}%")
-    if "ROE" in kpis: analysis.append(f"ROE ~ {kpis['ROE']*100:.1f}%")
-    if "ROA" in kpis: analysis.append(f"ROA ~ {kpis['ROA']*100:.1f}%")
-    suggestions = [
-        "Optimiza capital de trabajo (cobranza, inventario, pagos).",
-        "Revisa estructura de costos para mejorar margen operacional.",
-        "Equilibra apalancamiento y riesgo (cobertura de intereses).",
-        "Planifica caja con escenarios y colchón de liquidez.",
-        "Define OKRs (margen, ROE) y monitorea mensual.",
-    ]
-    return {"kpis": kpis, "analysis": analysis, "suggestions": suggestions, "contact": "dreamingup7@gmail.com"}
+    if not pdfs:
+        return {"message":"Sube al menos un PDF"}
+
+    period = (body.get("period") or "").strip()
+    k = extract_kpis_from_pdfs(pdfs)
+
+    def pct(x): return f"{x*100:.1f}%" if x is not None else "s/d"
+    val = lambda x: f"{x:,.0f}".replace(",",".") if isinstance(x,(int,float)) else "s/d"
+
+    lines = []
+    lines.append(f"**Período**: {period or 'no especificado'}")
+    lines.append("")
+    lines.append("## 1) Resumen de KPIs")
+    for key in ["revenue","cogs","gross_profit","operating_income","net_income","total_assets","total_equity","total_liabilities","current_assets","current_liabilities","inventory","accounts_receivable","accounts_payable","ebitda","interest_expense","working_capital"]:
+        if key in k.get("raw",{}):
+            lines.append(f"- {key}: {val(k['raw'][key])}")
+
+    lines.append("")
+    lines.append("## 2) Márgenes")
+    lines.append(f"- Margen Bruto: {pct(k.get('gross_margin'))}")
+    lines.append(f"- Margen Operacional: {pct(k.get('operating_margin'))}")
+    lines.append(f"- Margen Neto: {pct(k.get('net_margin'))}")
+
+    lines.append("")
+    lines.append("## 3) Liquidez")
+    lines.append(f"- Razón Corriente (CA/CL): {k.get('current_ratio','s/d')}")
+    lines.append(f"- Prueba Ácida (CA-Inv)/CL: {k.get('quick_ratio','s/d')}")
+
+    lines.append("")
+    lines.append("## 4) Endeudamiento")
+    lines.append(f"- Deuda/Activos: {pct(k.get('debt_ratio')) if isinstance(k.get('debt_ratio'),float) else k.get('debt_ratio','s/d')}")
+    lines.append(f"- Deuda/Patrimonio: {k.get('debt_to_equity','s/d')}")
+    lines.append(f"- Cobertura de Intereses (EBIT/Intereses): {k.get('interest_coverage','s/d')}")
+
+    lines.append("")
+    lines.append("## 5) Rentabilidad")
+    lines.append(f"- ROA: {pct(k.get('ROA'))}")
+    lines.append(f"- ROE: {pct(k.get('ROE'))}")
+    lines.append(f"- Rotación de Activos (Ventas/Activos): {k.get('asset_turnover','s/d')}")
+
+    lines.append("")
+    lines.append("## 6) Actividad")
+    lines.append(f"- Días de Cuentas por Cobrar: {k.get('days_receivable','s/d')}")
+    lines.append(f"- Días de Cuentas por Pagar: {k.get('days_payable','s/d')}")
+    lines.append(f"- Rotación de Inventario (COGS/Inv): {k.get('inventory_turnover','s/d')}")
+
+    lines.append("")
+    lines.append("## 7) Flujo de Caja")
+    lines.append("- Requiere estado de flujos para detalle. Si lo tienes, súbelo para estimar CFO/CFI/CFF y cobertura de caja.")
+
+    lines.append("")
+    lines.append("## 8) Punto de Equilibrio")
+    lines.append("- Se calcula con costos fijos y margen de contribución. Si el PDF expone ambos, puedo estimarlo en una versión futura.")
+
+    lines.append("")
+    lines.append("## 9) Análisis Vertical y Horizontal")
+    lines.append("- Con balances comparativos y resultados por períodos puedo generar AV/AH. Sube estados con al menos 2 años.")
+
+    lines.append("")
+    lines.append("## 10) Apalancamiento (F, O, T)")
+    lines.append("- Con detalle de costos fijos/variables y estructura de capital puedo calcular grados de apalancamiento.")
+
+    lines.append("")
+    lines.append("## 11) Modelo Z (quiebra)")
+    lines.append("- Requiere activo circulante, pasivo circulante, utilidades retenidas, EBIT, valor de mercado del patrimonio y ventas.")
+    lines.append("- Si subes esos datos (o estados detallados), puedo estimarlo.")
+
+    lines.append("")
+    lines.append("## 12) Tesorería (30/60/90)")
+    lines.append("- Con antigüedad de saldos de clientes/proveedores, puedo construir el semáforo a 30/60/90.")
+
+    lines.append("")
+    lines.append("## Conclusiones & Recomendaciones")
+    tips = []
+    if k.get("current_ratio") and k["current_ratio"]<1:
+        tips.append("Refuerza capital de trabajo: mejora cobros, renegocia plazos con proveedores, reduce inventario lento.")
+    if k.get("debt_to_equity") and k["debt_to_equity"]>2:
+        tips.append("Alto apalancamiento: evalúa capitalizar utilidades o reestructurar deuda para bajar riesgo financiero.")
+    if k.get("net_margin") and k["net_margin"]<0.05:
+        tips.append("Margen neto bajo: revisa gastos fijos y precios; busca eficiencias operativas.")
+    if not tips: tips.append("Los datos son parciales; sube estados más detallados para un diagnóstico profundo.")
+    lines += [f"- {t}" for t in tips]
+
+    return {"kpis": k, "report_markdown": "\n".join(lines)}
+
 
 # Salud
 from fastapi.responses import HTMLResponse, PlainTextResponse
