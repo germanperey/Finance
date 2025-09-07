@@ -11,3 +11,5 @@ numpy
 jinja2
 python-jose[cryptography]
 mercadopago
+flask
+gunicorn

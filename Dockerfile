@@ -1,8 +1,15 @@
 FROM python:3.11-slim
 WORKDIR /app
+
+# instala dependencias
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY app.py .
-EXPOSE 8000
-ENV PORT=8000
-CMD ["sh","-c","uvicorn app:app --host 0.0.0.0 --port ${PORT:-8000}"]
+
+# copia TODO (incluye templates/, static/, etc.)
+COPY . .
+
+# Render provee PORT => no lo fijes, solo expón opcionalmente
+EXPOSE 10000
+
+# si tu archivo es app.py y el objeto se llama app → app:app
+CMD ["bash","-lc","gunicorn app:app --bind 0.0.0.0:${PORT}"]
