@@ -49,7 +49,7 @@ class Settings(BaseSettings):
     APP_NAME: str = "Asesor Financiero 1‑día"
 
     STORAGE_DIR: str = "storage"
-    MODEL_NAME: str = "paraphrase-multilingual-MiniLM-L12-v2"
+    MODEL_NAME: str = "intfloat/multilingual-e5-small"
     CHUNK_SIZE: int = 900
     CHUNK_OVERLAP: int = 200
     MIN_CHARS: int = 200
