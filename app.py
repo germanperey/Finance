@@ -479,20 +479,39 @@ def require_user(request: Request) -> str:
     token = auth.split(" ",1)[1]
     return read_token(token)
 
+from typing import Optional
+
 @app.post("/upload")
-async def upload(request: Request, files: List[UploadFile] = File(...)):
+async def upload(request: Request, files: Optional[List[UploadFile]] = File(None)):
     uid = require_user(request)
     base = user_dir(uid); ensure_dirs(base)
-    saved: List[Path] = []
+
+    info = {"received": 0, "saved": [], "errors": []}
+    saved_paths: List[Path] = []
+
+    if not files:
+        return {"message": "no files in request", **info}
+
     for f in files:
-        if not f.filename.lower().endswith('.pdf'):
-            raise HTTPException(400, 'Solo PDFs')
-        dest = base/"docs"/f.filename
-        content = await f.read()
-        with open(dest, 'wb') as out: out.write(content)
-        saved.append(dest)
-    fragments = add_pdfs_to_index(base, saved)
-    return {"uploaded": [p.name for p in saved], "fragments_indexed": fragments}
+        try:
+            fn = (f.filename or "archivo.pdf").strip()
+            if not fn.lower().endswith(".pdf"):
+                info["errors"].append({fn: "Solo PDFs"})
+                continue
+            dest = base / "docs" / fn
+            content = await f.read()
+            with open(dest, "wb") as out:
+                out.write(content)
+            info["received"] += 1
+            info["saved"].append(fn)
+            saved_paths.append(dest)
+        except Exception as e:
+            info["errors"].append({f.filename or "archivo": str(e)})
+
+    fragments = add_pdfs_to_index(base, saved_paths)
+    info["fragments_indexed"] = fragments
+    return info
+
 
 @app.post("/ask")
 async def ask(request: Request, body: Dict[str, Any]):
