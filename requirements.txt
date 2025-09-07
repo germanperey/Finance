@@ -1,16 +1,16 @@
 fastapi
 uvicorn[standard]
 gunicorn
+mercadopago
 python-multipart
 pydantic-settings
-stripe
 sentence-transformers
 faiss-cpu
 PyMuPDF
 pdfplumber
 numpy
-jinja2
 python-jose[cryptography]
-mercadopago
+stripe
+jinja2
 flask
 

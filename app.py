@@ -291,11 +291,11 @@ async def mp_create_preference(payload: Dict[str, str]):
             "currency_id": settings.MP_CURRENCY,
             "unit_price": float(settings.MP_PRICE_1DAY),
         }],
-        "payer": {"email": gmail},                   # ← IMPORTANTE
+        "payer": {"email": gmail},                   # IMPORTANTE
         "back_urls": {
             "success": f"{settings.BASE_URL}/mp/return",
             "failure": f"{settings.BASE_URL}/mp/return",
-            "pending": f"{settings.BASE_URL}/mp/return",
+            "pending":  f"{settings.BASE_URL}/mp/return",
         },
         "auto_return": "approved",
         "purpose": "wallet_purchase",
@@ -466,6 +466,9 @@ async def report(request: Request, body: Dict[str, Any]):
     return {"kpis": kpis, "analysis": analysis, "suggestions": suggestions, "contact": "germanperey@gmail.com"}
 
 # Salud
+from fastapi.responses import HTMLResponse, PlainTextResponse
+
 @app.get("/health")
 async def health():
-    return {"ok": True, "name": settings.APP_NAME}
+    return PlainTextResponse("ok", status_code=200)
+
