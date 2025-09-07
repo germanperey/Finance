@@ -67,6 +67,7 @@ except Exception as e:
     SETTINGS_ERROR = str(e)
     settings = None
 
+APP_NAME_SAFE = (settings.APP_NAME if settings else "Asesor Financiero 1-día")
 app = FastAPI(title=(settings.APP_NAME if settings else "Finance"))
 app.add_middleware(
     CORSMiddleware,
@@ -212,11 +213,19 @@ def read_token(token: str) -> str:
         raise HTTPException(status_code=401, detail="Token inválido o expirado")
 
 # ===================== HTML =====================
-BASE_HTML = f"""
-<!doctype html><html lang=es><head>
-<meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+BASE_HTML = f"""<!doctype html>
+<html lang=es>
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{APP_NAME_SAFE}</title>
-<style>body{{font-family:system-ui;margin:2rem}} .card{{max-width:860px;margin:auto;padding:1.2rem 1.5rem;border:1px solid #e5e7eb;border-radius:14px;box-shadow:0 10px 30px rgba(0,0,0,.06)}} input,button{{padding:.6rem .8rem;border-radius:10px;border:1px solid #d1d5db;width:100%}} button{{background:#111;color:#fff;border:none;cursor:pointer}} .row{{display:flex;gap:12px;flex-wrap:wrap}} .muted{{color:#6b7280}}</style>
+<style>
+  body{{font-family:system-ui;margin:2rem}}
+  .card{{max-width:860px;margin:auto;padding:1.2rem 1.5rem;border:1px solid #e5e7eb;border-radius:14px;box-shadow:0 10px 30px rgba(0,0,0,.06)}}
+  input,button{{padding:.6rem .8rem;border-radius:10px;border:1px solid #d1d5db;width:100%}}
+  button{{background:#111;color:#fff;border:none;cursor:pointer}}
+  .row{{display:flex;gap:12px;flex-wrap:wrap}}
+  .muted{{color:#6b7280}}
+</style>
 <script>
 async function startCheckout(ev){
   ev.preventDefault();
@@ -228,7 +237,7 @@ async function startCheckout(ev){
   const gmail    = (fd.get('gmail')   || '').toString().trim();
   const coupon   = (fd.get('coupon')  || '').toString().trim();
 
-  if(!/^[^@\s]+@gmail\.com$/.test(gmail)){ alert('Ingresa un Gmail válido'); return; }
+  if(!/^[^@\\s]+@gmail\\.com$/.test(gmail)){ alert('Ingresa un Gmail válido'); return; }
 
   const r = await fetch('/mp/create-preference', {
     method: 'POST',
@@ -238,31 +247,36 @@ async function startCheckout(ev){
   const data = await r.json();
 
   if (data.skip === true && data.token){
-    localStorage.setItem('token', data.token); // cupón 100%
+    localStorage.setItem('token', data.token);   // cupón 100% → entra directo
     location.href = '/portal';
     return;
   }
-
   if(!data.init_point){ alert('No se pudo crear la preferencia'); return; }
-  location.href = data.init_point; // Mercado Pago
+  location.href = data.init_point;               // ir a Mercado Pago
 }
 </script>
-</head><body>
-<div class=card>
-<h1>{APP_NAME_SAFE}</h1>
-<p class=muted>Acceso por 24h tras el pago con Mercado Pago. Sube tus informes PDF y obtén KPI + análisis + sugerencias. Para asesoría completa: <b>germanperey@gmail.com</b>.</p>
-<form onsubmit="startCheckout(event)">
-  <div class=row>
-    <input name=nombre placeholder="Nombre" required>
-    <input name=apellido placeholder="Apellido" required>
-    <input name=gmail placeholder="Gmail (obligatorio)" required>
-    <input name=coupon placeholder="Cupón (opcional)">
-  </div>
-  <div style="margin-top:12px"><button>Pagar y acceder por 1 día</button></div>
-</form>
+</head>
+<body>
+<div class="card">
+  <h1>{APP_NAME_SAFE}</h1>
+  <p class="muted">Acceso por 24h tras el pago con Mercado Pago. Sube tus informes PDF y obtén KPI + análisis + sugerencias. Para asesoría completa: <b>dreamingup7@gmail.com</b>.</p>
+
+  <form onsubmit="startCheckout(event)">
+    <div class="row">
+      <input name="nombre"   placeholder="Nombre" required>
+      <input name="apellido" placeholder="Apellido" required>
+      <input name="gmail"    placeholder="Gmail (obligatorio)" required>
+      <!-- ESTE ES EL CAMPO NUEVO -->
+      <input name="coupon"   placeholder="Cupón (opcional)">
+    </div>
+    <div style="margin-top:12px">
+      <button>Pagar y acceder por 1 día</button>
+    </div>
+  </form>
 </div>
-</body></html>
-"""
+</body>
+</html>"""
+
 
 PORTAL_HTML = """
 <!doctype html><html lang=es><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Portal</title>
@@ -505,7 +519,7 @@ async def report(request: Request, body: Dict[str, Any]):
         "Planifica caja con escenarios y colchón de liquidez.",
         "Define OKRs (margen, ROE) y monitorea mensual.",
     ]
-    return {"kpis": kpis, "analysis": analysis, "suggestions": suggestions, "contact": "germanperey@gmail.com"}
+    return {"kpis": kpis, "analysis": analysis, "suggestions": suggestions, "contact": "dreamingup7@gmail.com"}
 
 # Salud
 from fastapi.responses import HTMLResponse, PlainTextResponse
