@@ -326,75 +326,61 @@ PORTAL_HTML = """
 </div>
 
 <script>
-const MAX_FILES = {settings.MAX_UPLOAD_FILES};
-const SINGLE_MAX = {settings.SINGLE_FILE_MAX_MB}; // MB
-const TOTAL_MAX  = {settings.MAX_TOTAL_MB};       // MB
+const MAX_FILES = [MAX_FILES];
+const SINGLE_MAX = [SINGLE_MAX]; // MB por archivo
+const TOTAL_MAX  = [TOTAL_MAX];  // MB por subida
 
 function toMB(n){ return (n/1024/1024).toFixed(1) + " MB"; }
 
-async function withToken(url,opts={{}}){
-  const t=localStorage.getItem('token');
-  opts.headers=Object.assign({'Authorization':'Bearer '+t},opts.headers||{});
+async function withToken(url,opts={}){
+  const t = localStorage.getItem('token') || '';
+  opts.headers = Object.assign({'Authorization':'Bearer '+t}, opts.headers||{});
   return fetch(url,opts);
 }
 
-// SUBIR PDFs (con validaciones de cantidad y peso)
 up.onsubmit = async e => {
   e.preventDefault();
   const input = up.querySelector('input[type=file]');
   const files = Array.from(input.files || []);
-  const box   = document.getElementById('upres');
-
-  if (!files.length) { box.textContent = "Selecciona al menos un PDF."; return; }
-  if (files.length > MAX_FILES) { box.textContent = `Máximo ${MAX_FILES} PDFs por subida.`; return; }
-
+  if (!files.length) { upres.textContent = "Selecciona al menos un PDF."; return; }
+  if (files.length > MAX_FILES) { upres.textContent = `Máximo ${MAX_FILES} PDFs por subida.`; return; }
   let total = 0;
   for (const f of files) {
     total += f.size;
-    if (!/\\.pdf$/i.test(f.name)) { box.textContent = `${f.name}: solo PDF`; return; }
-    if (f.size > SINGLE_MAX*1024*1024) { box.textContent = `${f.name} supera ${SINGLE_MAX} MB`; return; }
+    if (!/\.pdf$/i.test(f.name)) { upres.textContent = `${f.name}: solo PDF`; return; }
+    if (f.size > SINGLE_MAX*1024*1024) { upres.textContent = `${f.name} supera ${SINGLE_MAX} MB (${toMB(f.size)})`; return; }
   }
   if (total > TOTAL_MAX*1024*1024) {
-    box.textContent = `Superaste el total permitido (${TOTAL_MAX} MB).`;
+    upres.textContent = `Superaste el total permitido (${TOTAL_MAX} MB). Subiste ${toMB(total)}.`;
     return;
   }
-
-  box.textContent = "Subiendo...";
   const fd = new FormData(up);
   const r  = await withToken('/upload',{method:'POST',body:fd});
-  box.textContent = `HTTP ${r.status}\\n` + await r.text();
+  upres.textContent = `HTTP ${r.status}\n` + await r.text();
 };
 
-// PREGUNTAR (hasta 5 preguntas en una sola llamada)
 askf.onsubmit = async e => {
   e.preventDefault();
-  const raw  = new FormData(askf).get('questions') || '';
-  const list = raw.split(/\\r?\\n/).map(x=>x.trim()).filter(Boolean).slice(0,5);
-  const box  = document.getElementById('askres');
-
-  if (!list.length) { box.textContent = "Escribe al menos 1 pregunta (una por línea)."; return; }
-
-  box.textContent = "Consultando...";
+  const raw = new FormData(askf).get('questions') || '';
+  const list = raw.split(/\r?\n/).map(x=>x.trim()).filter(Boolean).slice(0,5);
+  if (!list.length) { askres.textContent = "Escribe al menos 1 pregunta (una por línea)."; return; }
   const r = await withToken('/ask',{
     method:'POST',
     headers:{'Content-Type':'application/json'},
     body: JSON.stringify({questions: list, top_k: 6})
   });
-  box.textContent = `HTTP ${r.status}\\n` + await r.text();
+  askres.textContent = `HTTP ${r.status}\n` + await r.text();
 };
 
-// REPORTE
 rep.onsubmit = async e => {
   e.preventDefault();
   const periodo = new FormData(rep).get('periodo') || '';
-  const box = document.getElementById('repres');
-  box.textContent = "Generando...";
   const r = await withToken('/report',{
     method:'POST',
     headers:{'Content-Type':'application/json'},
     body: JSON.stringify({period: periodo})
   });
-  box.textContent = `HTTP ${r.status}\\n` + await r.text();
+  repres.textContent = `HTTP ${r.status}\n` + await r.text();
 };
 </script>
 </body></html>
@@ -491,7 +477,11 @@ async def mp_return(status: str | None = None, payment_id: str | None = None, co
 
 @app.get("/portal", response_class=HTMLResponse)
 async def portal():
-    return HTMLResponse(PORTAL_HTML)
+    html = (PORTAL_HTML
+            .replace("[MAX_FILES]", str(settings.MAX_UPLOAD_FILES))
+            .replace("[SINGLE_MAX]", str(settings.SINGLE_FILE_MAX_MB))
+            .replace("[TOTAL_MAX]", str(settings.MAX_TOTAL_MB)))
+    return HTMLResponse(html)
 
 # (Opcional) Webhook para notificaciones asincrónicas
 # @app.post("/mp/webhook")
