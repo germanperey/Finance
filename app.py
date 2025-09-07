@@ -220,29 +220,34 @@ BASE_HTML = f"""
 <script>
 async function startCheckout(ev){
   ev.preventDefault();
-  const f = ev.target.closest('form');
-  const nombre  = f.nombre.value.trim();
-  const apellido= f.apellido.value.trim();
-  const gmail   = f.gmail.value.trim();
-  const coupon  = (f.coupon?.value || '').trim();
+  const f  = ev.target.closest('form');
+  const fd = new FormData(f);             // <-- más robusto que f.coupon?.value
+
+  const nombre   = (fd.get('nombre')  || '').toString().trim();
+  const apellido = (fd.get('apellido')|| '').toString().trim();
+  const gmail    = (fd.get('gmail')   || '').toString().trim();
+  const coupon   = (fd.get('coupon')  || '').toString().trim();
+
   if(!/^[^@\s]+@gmail\.com$/.test(gmail)){ alert('Ingresa un Gmail válido'); return; }
 
-  const r = await fetch('/mp/create-preference',{
-    method:'POST',
-    headers:{'Content-Type':'application/json'},
+  const r = await fetch('/mp/create-preference', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ nombre, apellido, gmail, coupon })
   });
   const data = await r.json();
 
   if (data.skip === true && data.token){
-    // cupón 100% → acceso directo sin pasar por MP
-    localStorage.setItem('token', data.token);
+    localStorage.setItem('token', data.token); // cupón 100%
     location.href = '/portal';
     return;
   }
 
-  if(!data.init_point){ alert('No se pudo crear la preferencia'); return; }
-  location.href = data.init_point; // ir a Checkout Pro
+  if(!data.init_point){
+    alert('No se pudo crear la preferencia'); 
+    return;
+  }
+  location.href = data.init_point; // ir a Mercado Pago
 }
 </script>
 </head><body>
