@@ -530,8 +530,20 @@ def __check_coupon():
         "coupon_field_in_template": "name=coupon" in BASE_HTML
     }
 
+from fastapi.responses import PlainTextResponse  # (déjalo importado)
+
 @app.get("/health")
 async def health():
-    if SETTINGS_ERROR:
-        return PlainTextResponse("settings_error: " + SETTINGS_ERROR, status_code=500)
     return PlainTextResponse("ok", status_code=200)
+
+@app.get("/__version")
+def __version():
+    import re
+    # intenta extraer cualquier correo que aparezca en el HTML
+    m = re.search(r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+', BASE_HTML)
+    email = m.group(0) if m else None
+    return {
+        "has_coupon_field": 'name="coupon"' in BASE_HTML,
+        "email_in_html": email,
+        "has_dreamingup7": 'dreamingup7@gmail.com' in BASE_HTML,
+    }
