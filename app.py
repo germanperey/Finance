@@ -281,7 +281,7 @@ async function startCheckout(ev){
 </html>"""
 
 
-PORTAL_HTML = f"""
+PORTAL_HTML = """
 <!doctype html><html lang=es><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Portal</title>
 <style>
   body{font-family:system-ui;margin:2rem}
