@@ -221,7 +221,7 @@ BASE_HTML = f"""
 async function startCheckout(ev){
   ev.preventDefault();
   const f  = ev.target.closest('form');
-  const fd = new FormData(f);             // <-- más robusto que f.coupon?.value
+  const fd = new FormData(f);
 
   const nombre   = (fd.get('nombre')  || '').toString().trim();
   const apellido = (fd.get('apellido')|| '').toString().trim();
@@ -243,11 +243,8 @@ async function startCheckout(ev){
     return;
   }
 
-  if(!data.init_point){
-    alert('No se pudo crear la preferencia'); 
-    return;
-  }
-  location.href = data.init_point; // ir a Mercado Pago
+  if(!data.init_point){ alert('No se pudo crear la preferencia'); return; }
+  location.href = data.init_point; // Mercado Pago
 }
 </script>
 </head><body>
@@ -266,7 +263,6 @@ async function startCheckout(ev){
 </div>
 </body></html>
 """
-
 
 PORTAL_HTML = """
 <!doctype html><html lang=es><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Portal</title>
@@ -513,6 +509,12 @@ async def report(request: Request, body: Dict[str, Any]):
 
 # Salud
 from fastapi.responses import HTMLResponse, PlainTextResponse
+
+@app.get("/__check_coupon")
+def __check_coupon():
+    return {
+        "coupon_field_in_template": "name=coupon" in BASE_HTML
+    }
 
 @app.get("/health")
 async def health():
