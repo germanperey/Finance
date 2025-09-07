@@ -303,10 +303,68 @@ PORTAL_HTML = """
 <pre id=repres></pre>
 </div>
 <script>
-async function withToken(url,opts={{}}){const t=localStorage.getItem('token');opts.headers=Object.assign({'Authorization':'Bearer '+t},opts.headers||{});return fetch(url,opts)}
-up.onsubmit=async e=>{e.preventDefault();const fd=new FormData(up);const r=await withToken('/upload',{method:'POST',body:fd});upres.textContent=await r.text()}
-askf.onsubmit=async e=>{e.preventDefault();const q=new FormData(askf).get('q');const r=await withToken('/ask',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:q,top_k:6})});askres.textContent=await r.text()}
-rep.onsubmit=async e=>{e.preventDefault();const periodo=new FormData(rep).get('periodo')||'';const r=await withToken('/report',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({period:periodo})});repres.textContent=await r.text()}
+async function withToken(url, opts = {}) {
+  const t = localStorage.getItem('token') || '';
+  opts.headers = Object.assign({'Authorization': 'Bearer ' + t}, opts.headers || {});
+  return fetch(url, opts);
+}
+
+function show(el, text) {
+  el.textContent = (typeof text === 'string') ? text : JSON.stringify(text, null, 2);
+}
+
+// SUBIR PDFs
+up.onsubmit = async (e) => {
+  e.preventDefault();
+  const fd = new FormData(up);
+  const box = document.getElementById('upres');
+  show(box, 'Subiendo...');
+  try {
+    const r = await withToken('/upload', { method: 'POST', body: fd });
+    const body = await r.text();
+    show(box, `HTTP ${r.status}\n\n${body}`);
+  } catch (err) {
+    show(box, 'ERROR de red: ' + err);
+  }
+};
+
+// PREGUNTAR
+askf.onsubmit = async (e) => {
+  e.preventDefault();
+  const q   = new FormData(askf).get('q');
+  const box = document.getElementById('askres');
+  show(box, 'Consultando...');
+  try {
+    const r = await withToken('/ask', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ question: q, top_k: 6 })
+    });
+    const body = await r.text();
+    show(box, `HTTP ${r.status}\n\n${body}`);
+  } catch (err) {
+    show(box, 'ERROR de red: ' + err);
+  }
+};
+
+// REPORTE
+rep.onsubmit = async (e) => {
+  e.preventDefault();
+  const periodo = new FormData(rep).get('periodo') || '';
+  const box = document.getElementById('repres');
+  show(box, 'Generando...');
+  try {
+    const r = await withToken('/report', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ period: periodo })
+    });
+    const body = await r.text();
+    show(box, `HTTP ${r.status}\n\n${body}`);
+  } catch (err) {
+    show(box, 'ERROR de red: ' + err);
+  }
+};
 </script>
 </body></html>
 """
