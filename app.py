@@ -67,7 +67,8 @@ except Exception as e:
     SETTINGS_ERROR = str(e)
     settings = None
 
-APP_NAME_SAFE = (settings.APP_NAME if settings else "Asesor Financiero 1-día")
+APP_NAME_SAFE = (settings.APP_NAME if settings else "Asesor Financiero")
+
 app = FastAPI(title=(settings.APP_NAME if settings else "Finance"))
 app.add_middleware(
     CORSMiddleware,
@@ -213,18 +214,18 @@ def read_token(token: str) -> str:
         raise HTTPException(status_code=401, detail="Token inválido o expirado")
 
 # ===================== HTML =====================
-BASE_HTML = f"""<!doctype html>
-<html lang=es>
+BASE_HTML = """<!doctype html>
+<html lang="es">
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{APP_NAME_SAFE}</title>
+<title>[APPNAME]</title>
 <style>
-  body{{font-family:system-ui;margin:2rem}}
-  .card{{max-width:860px;margin:auto;padding:1.2rem 1.5rem;border:1px solid #e5e7eb;border-radius:14px;box-shadow:0 10px 30px rgba(0,0,0,.06)}}
-  input,button{{padding:.6rem .8rem;border-radius:10px;border:1px solid #d1d5db;width:100%}}
-  button{{background:#111;color:#fff;border:none;cursor:pointer}}
-  .row{{display:flex;gap:12px;flex-wrap:wrap}}
-  .muted{{color:#6b7280}}
+  body{font-family:system-ui;margin:2rem}
+  .card{max-width:860px;margin:auto;padding:1.2rem 1.5rem;border:1px solid #e5e7eb;border-radius:14px;box-shadow:0 10px 30px rgba(0,0,0,.06)}
+  input,button{padding:.6rem .8rem;border-radius:10px;border:1px solid #d1d5db;width:100%}
+  button{background:#111;color:#fff;border:none;cursor:pointer}
+  .row{display:flex;gap:12px;flex-wrap:wrap}
+  .muted{color:#6b7280}
 </style>
 <script>
 async function startCheckout(ev){
@@ -237,28 +238,28 @@ async function startCheckout(ev){
   const gmail    = (fd.get('gmail')   || '').toString().trim();
   const coupon   = (fd.get('coupon')  || '').toString().trim();
 
-  if(!/^[^@\\s]+@gmail\\.com$/.test(gmail)){ alert('Ingresa un Gmail válido'); return; }
+  if(!/^[^\\s@]+@gmail\\.com$/.test(gmail)){ alert('Ingresa un Gmail válido'); return; }
 
   const r = await fetch('/mp/create-preference', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({ nombre, apellido, gmail, coupon })
   });
   const data = await r.json();
 
   if (data.skip === true && data.token){
-    localStorage.setItem('token', data.token);   // cupón 100% → entra directo
+    localStorage.setItem('token', data.token); // cupón 100% → entra directo
     location.href = '/portal';
     return;
   }
   if(!data.init_point){ alert('No se pudo crear la preferencia'); return; }
-  location.href = data.init_point;               // ir a Mercado Pago
+  location.href = data.init_point; // ir a Mercado Pago
 }
 </script>
 </head>
 <body>
 <div class="card">
-  <h1>{APP_NAME_SAFE}</h1>
+  <h1>[APPNAME]</h1>
   <p class="muted">Acceso por 24h tras el pago con Mercado Pago. Sube tus informes PDF y obtén KPI + análisis + sugerencias. Para asesoría completa: <b>dreamingup7@gmail.com</b>.</p>
 
   <form onsubmit="startCheckout(event)">
@@ -266,7 +267,6 @@ async function startCheckout(ev){
       <input name="nombre"   placeholder="Nombre" required>
       <input name="apellido" placeholder="Apellido" required>
       <input name="gmail"    placeholder="Gmail (obligatorio)" required>
-      <!-- ESTE ES EL CAMPO NUEVO -->
       <input name="coupon"   placeholder="Cupón (opcional)">
     </div>
     <div style="margin-top:12px">
@@ -314,7 +314,8 @@ rep.onsubmit=async e=>{e.preventDefault();const periodo=new FormData(rep).get('p
 # ===================== Rutas públicas =====================
 @app.get("/", response_class=HTMLResponse)
 async def home():
-    return HTMLResponse(BASE_HTML)
+    html = BASE_HTML.replace("[APPNAME]", APP_NAME_SAFE)
+    return HTMLResponse(html)
 
 @app.post("/mp/create-preference")
 async def mp_create_preference(payload: Dict[str, str]):
