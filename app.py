@@ -76,11 +76,10 @@ app.add_middleware(
 mp = mercadopago.SDK(settings.MP_ACCESS_TOKEN)
 # --- Cupones propios del comercio ---
 COUPONS = {
-    # 100% gratis (salta Mercado Pago)
     "INVESTU-100": {"type": "free", "desc": "Acceso gratis"},
-    # ejemplo de descuento porcentual:
     "INVESTU-50":  {"type": "percent", "value": 50, "desc": "50% OFF"},
 }
+
 
 # ===================== Embeddings & RAG (igual) =====================
 from sentence_transformers import SentenceTransformer
