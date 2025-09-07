@@ -30,13 +30,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import List, Dict, Any, Tuple
 
-import numpy as np
-import faiss
-import fitz   # PyMuPDF
-import pdfplumber
 import mercadopago
 from fastapi import FastAPI, Request, UploadFile, File, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic_settings import BaseSettings
 from jose import jwt, JWTError
@@ -88,7 +84,6 @@ COUPONS = {
 
 
 # ===================== Embeddings & RAG (igual) =====================
-from sentence_transformers import SentenceTransformer
 _model = None
 
 def get_model():
