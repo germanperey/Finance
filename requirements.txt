@@ -1,0 +1,13 @@
+fastapi
+uvicorn[standard]
+python-multipart
+pydantic-settings
+stripe
+sentence-transformers
+faiss-cpu
+pymupdf
+pdfplumber
+numpy
+jinja2
+python-jose[cryptography]
+mercadopago

@@ -1,0 +1,8 @@
+.env
+__pycache__/
+*.pyc
+*.log
+storage/
+.rag_index/
+.git
+.gitignore
