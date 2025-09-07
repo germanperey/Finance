@@ -12,4 +12,4 @@ COPY . .
 EXPOSE 10000
 
 # FastAPI con Gunicorn + worker Uvicorn
-CMD ["bash","-lc","gunicorn -k uvicorn.workers.UvicornWorker -w 2 -t 120 app:app --bind 0.0.0.0:${PORT}"]
+CMD ["bash","-lc","gunicorn -k uvicorn.workers.UvicornWorker -w 1 -t 120 app:app --bind 0.0.0.0:${PORT}"]

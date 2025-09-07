@@ -75,7 +75,7 @@ app.add_middleware(
 )
 
 # Mercado Pago SDK
-mp = mercadopago.SDK(settings.MP_ACCESS_TOKEN)
+mp = mercadopago.SDK(settings.MP_ACCESS_TOKEN) if settings else None
 # --- Cupones propios del comercio ---
 COUPONS = {
     "INVESTU-100": {"type": "free", "desc": "Acceso gratis"},
@@ -85,15 +85,17 @@ COUPONS = {
 
 # ===================== Embeddings & RAG (igual) =====================
 _model = None
-
 def get_model():
     global _model
     if _model is None:
+        from sentence_transformers import SentenceTransformer  # import aquí
         _model = SentenceTransformer(settings.MODEL_NAME)
     return _model
 
-def embed_texts(texts: List[str]) -> np.ndarray:
-    vecs = get_model().encode(texts, batch_size=32, convert_to_numpy=True, normalize_embeddings=settings.NORMALIZE)
+def embed_texts(texts: List[str]):
+    import numpy as np  # import aquí
+    vecs = get_model().encode(texts, batch_size=32, convert_to_numpy=True,
+                              normalize_embeddings=settings.NORMALIZE)
     return np.ascontiguousarray(vecs.astype("float32"))
 
 def clean_text(t: str) -> str:
@@ -139,6 +141,7 @@ def idx_paths(base: Path) -> Dict[str, Path]:
     return {"faiss": base/".rag_index"/"index.faiss", "meta": base/".rag_index"/"metadata.jsonl"}
 
 def load_index(base: Path):
+    import faiss  # import aquí
     p = idx_paths(base)
     dim = get_model().get_sentence_embedding_dimension()
     if p["faiss"].exists() and p["meta"].exists():
@@ -148,28 +151,35 @@ def load_index(base: Path):
     return faiss.IndexFlatIP(dim), []
 
 def save_index(base: Path, idx, meta: List[Dict[str, Any]]):
+    import faiss  # import aquí
     p = idx_paths(base)
     p["faiss"].parent.mkdir(parents=True, exist_ok=True)
     faiss.write_index(idx, str(p["faiss"]))
     with open(p["meta"], "w", encoding="utf-8") as f:
-        for m in meta: f.write(json.dumps(m, ensure_ascii=False) + "\n")
+        for m in meta:
+            f.write(json.dumps(m, ensure_ascii=False) + "\n")
 
 def add_pdfs_to_index(base: Path, pdfs: List[Path]) -> int:
+    import fitz  # PyMuPDF (import aquí)
     ensure_dirs(base)
     idx, meta = load_index(base)
     new_txt, new_meta = [], []
     for pdf in pdfs:
-        if not pdf.exists(): continue
+        if not pdf.exists(): 
+            continue
         with fitz.open(pdf) as doc:
             for page_num, page in enumerate(doc, start=1):
                 text = clean_text(page.get_text("text") or "")
-                if len(text) < 50: continue
+                if len(text) < 50:
+                    continue
                 for ck in chunk_text(text):
                     new_txt.append(ck)
                     new_meta.append({"doc_title": pdf.name, "page": page_num, "text": ck})
-    if not new_txt: return 0
+    if not new_txt:
+        return 0
     vecs = embed_texts(new_txt)
-    idx.add(vecs); meta.extend(new_meta)
+    idx.add(vecs)
+    meta.extend(new_meta)
     save_index(base, idx, meta)
     return len(new_txt)
 
@@ -205,25 +215,25 @@ def read_token(token: str) -> str:
 BASE_HTML = f"""
 <!doctype html><html lang=es><head>
 <meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
-<title>{settings.APP_NAME}</title>
+<title>{APP_NAME_SAFE}</title>
 <style>body{{font-family:system-ui;margin:2rem}} .card{{max-width:860px;margin:auto;padding:1.2rem 1.5rem;border:1px solid #e5e7eb;border-radius:14px;box-shadow:0 10px 30px rgba(0,0,0,.06)}} input,button{{padding:.6rem .8rem;border-radius:10px;border:1px solid #d1d5db;width:100%}} button{{background:#111;color:#fff;border:none;cursor:pointer}} .row{{display:flex;gap:12px;flex-wrap:wrap}} .muted{{color:#6b7280}}</style>
 <script>
-async function startCheckout(ev){{
+async function startCheckout(ev){
   ev.preventDefault();
   const f = ev.target.closest('form');
   const nombre = f.nombre.value.trim();
   const apellido = f.apellido.value.trim();
   const gmail = f.gmail.value.trim();
-  if(!/^[^@\s]+@gmail\.com$/.test(gmail)){{alert('Ingresa un Gmail válido');return;}}
-  const r = await fetch('/mp/create-preference',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{nombre,apellido,gmail}})}});
+  if(!/^[^@\\s]+@gmail\\.com$/.test(gmail)){alert('Ingresa un Gmail válido');return;}
+  const r = await fetch('/mp/create-preference',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({nombre,apellido,gmail})});
   const data = await r.json();
-  if(!data.init_point){{alert('No se pudo crear la preferencia');return;}}
-  location.href = data.init_point; // redirige a Checkout Pro
-}}
+  if(!data.init_point){alert('No se pudo crear la preferencia');return;}
+  location.href = data.init_point;
+}
 </script>
 </head><body>
 <div class=card>
-<h1>{settings.APP_NAME}</h1>
+<h1>{APP_NAME_SAFE}</h1>
 <p class=muted>Acceso por 24h tras el pago con Mercado Pago. Sube tus informes PDF y obtén KPI + análisis + sugerencias. Para asesoría completa: <b>germanperey@gmail.com</b>.</p>
 <form onsubmit="startCheckout(event)">
   <div class=row>
@@ -236,6 +246,7 @@ async function startCheckout(ev){{
 </div>
 </body></html>
 """
+
 
 PORTAL_HTML = """
 <!doctype html><html lang=es><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Portal</title>
@@ -417,6 +428,7 @@ def _num(s: str):
     except: return None
 
 def extract_kpis_from_pdfs(pdfs: List[Path]) -> Dict[str, Any]:
+    import pdfplumber  # import aquí
     values: Dict[str, float] = {}
     for pdf in pdfs:
         try:
@@ -472,6 +484,5 @@ from fastapi.responses import HTMLResponse, PlainTextResponse
 @app.get("/health")
 async def health():
     if SETTINGS_ERROR:
-        # Devuelve el error de arranque para diagnosticar (temporal)
         return PlainTextResponse("settings_error: " + SETTINGS_ERROR, status_code=500)
     return PlainTextResponse("ok", status_code=200)
