@@ -63,9 +63,15 @@ class Settings(BaseSettings):
     class Config:
         env_file = ".env"
 
-settings = Settings()
+# Cargar settings con manejo de error para que /health lo muestre si falla
+SETTINGS_ERROR = None
+try:
+    settings = Settings()
+except Exception as e:
+    SETTINGS_ERROR = str(e)
+    settings = None
 
-app = FastAPI(title=settings.APP_NAME)
+app = FastAPI(title=(settings.APP_NAME if settings else "Finance"))
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True,
@@ -470,5 +476,7 @@ from fastapi.responses import HTMLResponse, PlainTextResponse
 
 @app.get("/health")
 async def health():
+    if SETTINGS_ERROR:
+        # Devuelve el error de arranque para diagnosticar (temporal)
+        return PlainTextResponse("settings_error: " + SETTINGS_ERROR, status_code=500)
     return PlainTextResponse("ok", status_code=200)
-
