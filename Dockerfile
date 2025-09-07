@@ -4,14 +4,15 @@ WORKDIR /app
 # FAISS necesita libgomp (OpenMP)
 RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 && rm -rf /var/lib/apt/lists/*
 
-# dependencias python
+# instala dependencias
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# copia el código
+# copia TODO (incluye templates/, static/, etc.)
 COPY . .
 
-# Render te inyecta PORT
+# Render provee PORT
 EXPOSE 10000
-CMD ["bash","-lc","gunicorn app:app --bind 0.0.0.0:${PORT}"]
 
+# FastAPI con Gunicorn + worker Uvicorn
+CMD ["bash","-lc","gunicorn -k uvicorn.workers.UvicornWorker -w 1 -t 120 app:app --bind 0.0.0.0:${PORT}"]
