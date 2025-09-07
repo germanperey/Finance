@@ -221,14 +221,28 @@ BASE_HTML = f"""
 async function startCheckout(ev){
   ev.preventDefault();
   const f = ev.target.closest('form');
-  const nombre = f.nombre.value.trim();
-  const apellido = f.apellido.value.trim();
-  const gmail = f.gmail.value.trim();
-  if(!/^[^@\\s]+@gmail\\.com$/.test(gmail)){alert('Ingresa un Gmail válido');return;}
-  const r = await fetch('/mp/create-preference',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({nombre,apellido,gmail})});
+  const nombre  = f.nombre.value.trim();
+  const apellido= f.apellido.value.trim();
+  const gmail   = f.gmail.value.trim();
+  const coupon  = (f.coupon?.value || '').trim();
+  if(!/^[^@\s]+@gmail\.com$/.test(gmail)){ alert('Ingresa un Gmail válido'); return; }
+
+  const r = await fetch('/mp/create-preference',{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ nombre, apellido, gmail, coupon })
+  });
   const data = await r.json();
-  if(!data.init_point){alert('No se pudo crear la preferencia');return;}
-  location.href = data.init_point;
+
+  if (data.skip === true && data.token){
+    // cupón 100% → acceso directo sin pasar por MP
+    localStorage.setItem('token', data.token);
+    location.href = '/portal';
+    return;
+  }
+
+  if(!data.init_point){ alert('No se pudo crear la preferencia'); return; }
+  location.href = data.init_point; // ir a Checkout Pro
 }
 </script>
 </head><body>
@@ -240,6 +254,7 @@ async function startCheckout(ev){
     <input name=nombre placeholder="Nombre" required>
     <input name=apellido placeholder="Apellido" required>
     <input name=gmail placeholder="Gmail (obligatorio)" required>
+    <input name=coupon placeholder="Cupón (opcional)">
   </div>
   <div style="margin-top:12px"><button>Pagar y acceder por 1 día</button></div>
 </form>
@@ -288,22 +303,37 @@ async def home():
 
 @app.post("/mp/create-preference")
 async def mp_create_preference(payload: Dict[str, str]):
-    nombre = payload.get("nombre", "").strip()
+    nombre   = payload.get("nombre", "").strip()
     apellido = payload.get("apellido", "").strip()
-    gmail = payload.get("gmail", "").strip().lower()
+    gmail    = payload.get("gmail", "").strip().lower()
+    coupon   = (payload.get("coupon") or "").strip().upper()
+
     if not nombre or not apellido:
         raise HTTPException(400, "Nombre y Apellido son obligatorios")
     if not re.match(r"^[^@\s]+@gmail\.com$", gmail):
         raise HTTPException(400, "Debes usar un correo @gmail.com válido")
+
+    # --- Cupón propio ---
+    if coupon == "INVESTU-100":
+        # acceso gratis: generar token y NO pasar por Mercado Pago
+        uid = make_user_id(gmail)
+        ensure_dirs(user_dir(uid))
+        token = make_token(uid, 24)
+        return {"skip": True, "token": token}
+
+    # (opcional) descuento 50%
+    price = float(settings.MP_PRICE_1DAY)
+    if coupon == "INVESTU-50":
+        price = max(1.0, round(price * 0.5))
 
     preference = {
         "items": [{
             "title": f"Pase 1 día — {settings.APP_NAME}",
             "quantity": 1,
             "currency_id": settings.MP_CURRENCY,
-            "unit_price": float(settings.MP_PRICE_1DAY),
+            "unit_price": price,
         }],
-        "payer": {"email": gmail},                   # IMPORTANTE
+        "payer": {"email": gmail},
         "back_urls": {
             "success": f"{settings.BASE_URL}/mp/return",
             "failure": f"{settings.BASE_URL}/mp/return",
@@ -311,15 +341,13 @@ async def mp_create_preference(payload: Dict[str, str]):
         },
         "auto_return": "approved",
         "purpose": "wallet_purchase",
-        "metadata": {"gmail": gmail, "nombre": nombre, "apellido": apellido},
+        "metadata": {"gmail": gmail, "nombre": nombre, "apellido": apellido, "coupon": coupon},
         "external_reference": hashlib.sha1(gmail.encode()).hexdigest(),
     }
     try:
         pref = mp.preference().create(preference)["response"]
-        return {
-            "id": pref.get("id"),
-            "init_point": pref.get("init_point") or pref.get("sandbox_init_point"),
-        }
+        return {"id": pref.get("id"),
+                "init_point": pref.get("init_point") or pref.get("sandbox_init_point")}
     except Exception as e:
         raise HTTPException(500, f"Mercado Pago error: {e}")
 
