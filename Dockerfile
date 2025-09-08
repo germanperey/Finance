@@ -16,5 +16,5 @@ COPY . .
 # Render inyecta PORT
 EXPOSE 10000
 
-# Arranque: usa el PORT de Render, 1 worker (free tier) y timeout alto para cold start
-CMD ["bash","-lc","gunicorn app:app --bind 0.0.0.0:${PORT} --workers 1 --timeout 120"]
+# Arranque: usa el PORT de Render, 1 worker (free tier) 
+CMD ["bash","-lc","uvicorn app:app --host 0.0.0.0 --port ${PORT} --log-level info"]
