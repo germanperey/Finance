@@ -79,6 +79,27 @@ app.add_middleware(
     allow_methods=["*"], allow_headers=["*"],
 )
 
+# ---- Warm-up: precargar el modelo en segundo plano al iniciar ----
+from threading import Thread
+
+@app.on_event("startup")
+def _warm_start():
+    def _preload():
+        try:
+            print(">> Precargando modelo de embeddings...")
+            get_model()  # descarga/carga el modelo una vez
+            print(">> Modelo listo.")
+        except Exception as e:
+            print("!! Error precargando modelo:", e)
+    Thread(target=_preload, daemon=True).start()
+
+# Endpoint manual por si quieres forzarlo desde el navegador: /__warmup
+@app.get("/__warmup")
+def __warmup():
+    get_model()
+    return {"ok": True, "msg": "modelo listo"}
+
+
 # Mercado Pago SDK
 mp = mercadopago.SDK(settings.MP_ACCESS_TOKEN) if settings else None
 # --- Cupones propios del comercio ---
@@ -518,10 +539,15 @@ def require_user(request: Request) -> str:
     token = auth.split(" ",1)[1]
     return read_token(token)
 
+from fastapi import BackgroundTasks
 from typing import Optional
 
 @app.post("/upload")
-async def upload(request: Request, files: Optional[List[UploadFile]] = File(None)):
+async def upload(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    files: Optional[List[UploadFile]] = File(None)
+):
     uid = require_user(request)
     base = user_dir(uid); ensure_dirs(base)
 
@@ -554,14 +580,29 @@ async def upload(request: Request, files: Optional[List[UploadFile]] = File(None
         saved.append(dest)
 
     if total_size > total_max:
-        # borra los que guardamos en esta pasada si se excedió el total
         for p in saved:
             try: p.unlink(missing_ok=True)
             except: pass
         return {"ok": False, "message": f"Superaste el total permitido ({settings.MAX_TOTAL_MB} MB por subida)."}
 
-    fragments = add_pdfs_to_index(base, saved) if saved else 0
-    return {"ok": True, "saved": [p.name for p in saved], "fragments_indexed": fragments, "errors": errors}
+    # 👉 indexación en SEGUNDO PLANO (la respuesta sale al tiro)
+    if saved:
+        background_tasks.add_task(add_pdfs_to_index, base, saved)
+
+    return {
+        "ok": True,
+        "saved": [p.name for p in saved],
+        "indexing": "in_progress",
+        "note": "Estamos procesando tus PDFs en segundo plano."
+    }
+
+
+@app.get("/status")
+def status(request: Request):
+    uid = require_user(request)
+    base = user_dir(uid)
+    idx, meta = load_index(base)
+    return {"fragments": idx.ntotal, "docs": len({m['doc_title'] for m in meta})}
 
 
 @app.post("/ask")
