@@ -330,7 +330,8 @@ def premium_exec_summary(period: str, kpis: dict) -> str | None:
  
 
 # ===================== HTML =====================
-BASE_HTML = """<!doctype html>
+BASE_HTML = """
+<!doctype html>
 <html lang="es">
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -400,19 +401,29 @@ PORTAL_HTML = """
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Portal</title>
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.10/dist/katex.min.css">
 <style>
-  body{font-family:system-ui;margin:2rem}
-  .card{max-width:1000px;margin:auto;padding:1.2rem 1.5rem;border:1px solid #e5e7eb;border-radius:14px;box-shadow:0 10px 30px rgba(0,0,0,.06)}
-  input,button,textarea{padding:.6rem .8rem;border-radius:10px;border:1px solid #d1d5db;width:100%}
+  :root{--muted:#6b7280}
+  body{font-family:system-ui;margin:2rem;background:#fafafa}
+  .card{max-width:1000px;margin:auto;padding:1.2rem 1.5rem;border:1px solid #e5e7eb;border-radius:14px;box-shadow:0 10px 30px rgba(0,0,0,.06);background:#fff}
+  input,button,textarea{padding:.6rem .8rem;border-radius:10px;border:1px solid #d1d5db;width:100%;background:#fff}
   button{background:#111;color:#fff;border:none;cursor:pointer}
   pre{white-space:pre-wrap;background:#f9fafb;padding:1rem;border-radius:10px;border:1px solid #eee}
   .row{display:flex;gap:12px;flex-wrap:wrap}
-  .muted{color:#6b7280}
-  .md h1,.md h2,.md h3{margin:1rem 0 .4rem}
-  .md p,.md li{line-height:1.5}
-  .chartwrap{margin:12px 0}
+  .muted{color:var(--muted)}
+  .md h2,.md h3{margin:.8rem 0 .4rem}
+  .pill{display:inline-block;font-size:.75rem;color:#111;background:#e5e7eb;border-radius:999px;padding:.2rem .6rem;margin-left:.4rem}
+  .src{font-size:.85rem;color:var(--muted)}
+  .charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px;margin-top:10px}
+  .kpi{display:grid;grid-template-columns:1fr auto;gap:6px;padding:.6rem .8rem;border:1px solid #eee;border-radius:10px;background:#fbfbfb}
 </style>
+
+<!-- Librerías para render bonito -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/dompurify@3.0.9/dist/purify.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 </head>
 <body>
 <div class="card">
@@ -434,9 +445,11 @@ PORTAL_HTML = """
     </label>
     <div style="margin-top:8px"><button type="submit">Preguntar</button></div>
   </form>
+  <div class="muted" style="margin:.4rem 0">Puedes hacer hasta 5 preguntas a la vez (una por línea).</div>
+  <!-- 👉 contenedor “bonito” para respuestas -->
   <div id="askres" class="md"></div>
 
-  <hr>
+  <hr style="margin:18px 0">
 
   <!-- REPORTE -->
   <form id="rep">
@@ -444,72 +457,57 @@ PORTAL_HTML = """
     <small class="muted">Indica meses o años a evaluar. Ej: “2022–2024”, “ene–jun 2024”, “últimos 12 meses”.</small>
     <div style="margin-top:8px"><button>Generar Reporte Automático</button></div>
   </form>
-  <div id="repres" class="md"></div>
+
+  <!-- 👉 contenedor “bonito” para reporte -->
+  <div id="repres" class="md" style="margin-top:10px"></div>
+  <div id="repcharts" class="charts"></div>
 </div>
 
-<!-- Librerías para Markdown, sanitización, LaTeX y Chart.js -->
-<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/katex@0.16.10/dist/katex.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/katex@0.16.10/dist/contrib/auto-render.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
-
 <script>
-marked.setOptions({ breaks:true });
-
-function renderMD(el, md){
-  // 1) Intercepta bloques ```chart ...```
-  const charts = [];
-  const replaced = (md || '').replace(/```chart\\s*([\\s\\S]*?)```/g, (m, json) => {
-    try{
-      const cfg = JSON.parse(json);
-      const id = 'ch_' + Math.random().toString(36).slice(2,9);
-      charts.push({id, cfg});
-      return `<div class="chartwrap"><canvas id="${id}"></canvas></div>`;
-    }catch(e){
-      return `<pre>${m.replace(/</g,'&lt;')}</pre>`;
-    }
-  });
-
-  // 2) Markdown → HTML seguro
-  const html = DOMPurify.sanitize(marked.parse(replaced));
-  el.innerHTML = html;
-
-  // 3) Render LaTeX
-  try{
-    renderMathInElement(el, {
-      delimiters: [
-        {left: "$$", right: "$$", display: true},
-        {left: "$",  right: "$",  display: false},
-        {left: "\\(", right: "\\)", display: false},
-        {left: "\\[", right: "\\]", display: true},
-      ],
-      throwOnError: false
-    });
-  }catch(e){ /* ignora errores de fórmulas */ }
-
-  // 4) Pinta Chart.js
-  charts.forEach(c => {
-    const ctx = document.getElementById(c.id)?.getContext('2d');
-    if(ctx){
-      try{ new Chart(ctx, c.cfg); }catch(e){ /* ignora errores de config */ }
-    }
-  });
-}
-
 const MAX_FILES = [MAX_FILES];
-const SINGLE_MAX = [SINGLE_MAX];
-const TOTAL_MAX  = [TOTAL_MAX];
+const SINGLE_MAX = [SINGLE_MAX]; // MB por archivo
+const TOTAL_MAX  = [TOTAL_MAX];  // MB por subida
 
 function toMB(n){ return (n/1024/1024).toFixed(1) + " MB"; }
 
-async function withToken(url,opts={}){
+async function withToken(url,opts={}) {
   const t = localStorage.getItem('token') || '';
-  opts.headers = Object.assign({'Authorization':'Bearer '+t}, opts.headers||{});
+  opts.headers = Object.assign({'Authorization':'Bearer '+t}, opts.headers||{}, opts.headers);
   return fetch(url,opts);
 }
 
-// SUBIR PDFs (igual)
+// ------ Render Markdown + Matemáticas + Gráficos ------
+function renderMD(el, md){
+  try {
+    const raw = marked.parse(md || "");
+    const clean = DOMPurify.sanitize(raw);
+    el.innerHTML = clean;
+    // KaTeX
+    try {
+      renderMathInElement(el, {
+        delimiters: [
+          {left: "$$", right: "$$", display: true},
+          {left: "$",  right: "$",  display: false}
+        ]
+      });
+    } catch(e){}
+    // Bloques ```chart ...``` → Chart.js
+    const blocks = el.querySelectorAll("pre code.language-chart");
+    blocks.forEach((code, i) => {
+      const json = code.textContent.trim();
+      let cfg = null;
+      try { cfg = JSON.parse(json); } catch(e){ return; }
+      const pre = code.closest("pre");
+      const canvas = document.createElement("canvas");
+      pre.replaceWith(canvas);
+      new Chart(canvas.getContext('2d'), cfg);
+    });
+  } catch(err) {
+    el.textContent = "Error renderizando Markdown: " + err;
+  }
+}
+
+// ---------------- SUBIR PDFs ----------------
 up.onsubmit = async e => {
   e.preventDefault();
   const input = up.querySelector('input[type=file]');
@@ -535,7 +533,7 @@ up.onsubmit = async e => {
   box.textContent = `HTTP ${r.status}\\n` + await r.text();
 };
 
-// PREGUNTAR (hasta 5 preguntas) — ahora renderizamos Markdown + LaTeX + Chart
+// ---------------- PREGUNTAR ----------------
 askf.onsubmit = async (e) => {
   e.preventDefault();
   const raw = new FormData(askf).get('questions') || '';
@@ -543,7 +541,8 @@ askf.onsubmit = async (e) => {
   const prosa = document.getElementById('prosa')?.checked || false;
 
   const box = document.getElementById('askres');
-  renderMD(box, '_Consultando..._');
+  if (!list.length) { box.textContent = 'Escribe al menos 1 pregunta (una por línea).'; return; }
+  box.textContent = 'Consultando…';
 
   try {
     const r = await withToken('/ask', {
@@ -551,40 +550,82 @@ askf.onsubmit = async (e) => {
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({ questions: list, top_k: 6, prosa })
     });
-    const text = await r.text();
-    try{
-      const data = JSON.parse(text);
-      const md = (data.results || []).map((it, i) => {
-        const src = (it.sources||[]).map(s => `- ${s.doc_title} (p.${s.page}, score ${s.score})`).join('\\n') || '- s/d';
-        return `### Pregunta ${i+1}\n**${it.question}**\n\n${it.answer_markdown}\n\n**Fuentes**\\n${src}`;
-      }).join('\\n\\n---\\n\\n');
-      renderMD(box, `HTTP ${r.status}\\n\\n` + md);
-    }catch(parseErr){
-      renderMD(box, '```\n' + `HTTP ${r.status}\n` + text + '\n```');
-    }
+    const data = await r.json();
+
+    // Construye HTML bonito
+    let html = "";
+    (data.results || []).forEach((it, idx) => {
+      const tag = it.prosa_premium ? '<span class="pill">prosa IA</span>' : '';
+      html += `<h3>${idx+1}. ${it.question} ${tag}</h3><div id="ans_${idx}" class="md"></div>`;
+      if (Array.isArray(it.sources) && it.sources.length){
+        html += `<div class="src"><b>Fuentes:</b> ` +
+          it.sources.map(s => `${s.doc_title} (p.${s.page}, score ${s.score})`).join(" · ") +
+          `</div>`;
+      }
+    });
+    box.innerHTML = html || "<div class='muted'>Sin resultados.</div>";
+
+    // Render por ítem
+    (data.results || []).forEach((it, idx) => {
+      const el = document.getElementById('ans_'+idx);
+      renderMD(el, it.answer_markdown || "");
+    });
+
   } catch (err) {
-    renderMD(box, 'ERROR de red: ' + String(err));
+    box.textContent = 'ERROR de red: ' + err;
   }
 };
 
-// REPORTE — renderiza Markdown + LaTeX + Chart
+// ---------------- REPORTE ----------------
 rep.onsubmit = async e => {
   e.preventDefault();
   const periodo = new FormData(rep).get('periodo') || '';
-  const box = document.getElementById('repres');
-  renderMD(box, '_Generando reporte..._');
+  const repBox = document.getElementById('repres');
+  const chartsBox = document.getElementById('repcharts');
+  repBox.textContent = 'Generando…';
+  chartsBox.innerHTML = '';
 
   const r = await withToken('/report',{
     method:'POST',
     headers:{'Content-Type':'application/json'},
     body: JSON.stringify({period: periodo})
   });
-  const text = await r.text();
-  try{
-    const data = JSON.parse(text);
-    renderMD(box, `HTTP ${r.status}\\n\\n` + (data.report_markdown || ''));
-  }catch(e){
-    renderMD(box, '```\n' + `HTTP ${r.status}\n` + text + '\n```');
+
+  const data = await r.json();
+  // Markdown del reporte
+  renderMD(repBox, data.report_markdown || JSON.stringify(data,null,2));
+
+  // Gráficos rápidos a partir de KPIs si existen
+  const k = data.kpis || {};
+  const raw = (k.raw || {});
+  const moneyKeys = ['revenue','cogs','gross_profit','operating_income','net_income','ebitda'];
+  const ratioKeys = ['gross_margin','operating_margin','net_margin','current_ratio','quick_ratio','debt_ratio','debt_to_equity','ROA','ROE','asset_turnover'];
+
+  const mvals = moneyKeys.filter(k=>raw[k]!=null).map(k=>({k, v: raw[k]}));
+  if (mvals.length >= 2){
+    const cv = document.createElement('canvas'); chartsBox.appendChild(cv);
+    new Chart(cv, {
+      type:'bar',
+      data:{ labels:mvals.map(x=>x.k), datasets:[{label:'$ (unidades del PDF)', data:mvals.map(x=>x.v), backgroundColor:'#111'}]},
+      options:{plugins:{legend:{display:false}}, scales:{y:{beginAtZero:true}}}
+    });
+  }
+
+  const rvals = ratioKeys.filter(k=>k in kpisFlat(k)).map(k=>({k, v: kpisFlat(k)[k]}));
+  if (rvals.length){
+    const cv2 = document.createElement('canvas'); chartsBox.appendChild(cv2);
+    new Chart(cv2, {
+      type:'radar',
+      data:{ labels:rvals.map(x=>x.k), datasets:[{label:'Ratios', data:rvals.map(x=>x.v), backgroundColor:'rgba(17,17,17,.15)', borderColor:'#111'}]},
+      options:{scales:{r:{beginAtZero:true}}}
+    });
+  }
+
+  function kpisFlat(k){
+    // mezcla top-level + raw
+    const flat = Object.assign({}, k, k.raw||{});
+    delete flat.raw;
+    return flat;
   }
 };
 </script>
