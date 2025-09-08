@@ -28,7 +28,8 @@ from __future__ import annotations
 import os, re, json, hashlib, shutil
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import List, Dict, Any, Tuple, Optional
+from typing import List, Dict, Any, Tuple
+from typing import Optional
 
 import mercadopago
 from fastapi import FastAPI, Request, UploadFile, File, HTTPException, BackgroundTasks
@@ -271,43 +272,61 @@ def _gpt(system_msg: str, user_msg: str, max_tokens: int = 700) -> str | None:
 def premium_answer_for_question(question: str, ctx: list[dict]) -> str:
     """
     Redacción clara y accionable a partir de los fragmentos (ctx).
-    Si GPT no está disponible, devuelve fallback corto.
+    - Usa Markdown.
+    - Si necesitas fórmulas, usa LaTeX con $...$ o $$...$$.
+    - Si hay 2+ métricas comparables, añade AL FINAL un bloque de código `chart`
+      con JSON válido para Chart.js.
     """
-    # arma evidencia corta con top-5 pasajes
+    # evidencia (top-5)
     snips = []
     for c in (ctx or [])[:5]:
         doc = c.get("doc_title","?"); pg = c.get("page","?"); tx = c.get("text","")
         snips.append(f"[{doc} p.{pg}] {tx}")
     evidence = "\n\n".join(snips) or "(sin evidencia)"
 
-    sys = ("Eres un analista financiero senior. Escribe en español, muy claro y conciso. "
-           "Estructura en secciones con viñetas y subtítulos. No inventes datos.")
-    usr = (f"Pregunta del usuario:\n{question}\n\n"
-           f"Fragmentos del informe (usa SOLO estos datos como evidencia):\n{evidence}\n\n"
-           "Devuelve:\n"
-           "- Resumen ejecutivo (3–4 líneas).\n"
-           "- Hallazgos clave (viñetas, con cifras si aparecen).\n"
-           "- Recomendaciones accionables (viñetas).\n"
-           "- Riesgos/alertas si aplica.")
-    out = _gpt(sys, usr, max_tokens=700)
+    sys = (
+        "Eres un analista financiero senior. Responde en español, claro y conciso, usando Markdown. "
+        "Cuando sea útil, escribe fórmulas con LaTeX (delimitadores $...$ o $$...$$). "
+        "Si detectas 2 o más métricas numéricas comparables, agrega al FINAL exactamente "
+        "UN bloque de código con encabezado 'chart' que contenga JSON válido para Chart.js. "
+        "No inventes datos fuera de la evidencia; si faltan, dilo."
+    )
+    usr = (
+        f"Pregunta:\n{question}\n\n"
+        f"Evidencia (usa SOLO estos datos):\n{evidence}\n\n"
+        "Devuelve, en este orden:\n"
+        "1) Resumen ejecutivo (3–4 líneas).\n"
+        "2) Hallazgos clave (viñetas, con cifras si aparecen).\n"
+        "3) Recomendaciones accionables (viñetas) y riesgos/alertas.\n"
+        "4) (Opcional) Un bloque `chart` con JSON válido si hay suficientes números para comparar.\n"
+    )
+    out = _gpt(sys, usr, max_tokens=900)
     return out or "Pasajes más relevantes (ver 'evidence')."
+
 
 def premium_exec_summary(period: str, kpis: dict) -> str | None:
     """
-    Crea un ‘resumen ejecutivo’ del reporte a partir de KPIs extraídos.
-    Devuelve None si GPT no está disponible.
+    Resumen ejecutivo del reporte a partir de KPIs (si hay OPENAI_API_KEY).
+    - Usa Markdown y LaTeX si corresponde.
+    - Incluye al FINAL un bloque `chart` (Chart.js) con 1 gráfico sencillo
+      si hay datos (p. ej., ratios clave).
     """
     if not _premium_on():
         return None
-    # compacta KPIs numéricos que ya calculaste
     import json
-    sys = ("Eres un consultor financiero. Redacta un resumen ejecutivo en español, "
-           "con tono profesional, claro, en 8–12 viñetas máximo. No inventes.")
-    usr = (f"Período: {period or 'no especificado'}\n\n"
-           "KPIs y cálculos disponibles (JSON):\n"
-           f"{json.dumps(kpis, ensure_ascii=False)}\n\n"
-           "Incluye: liquidez, endeudamiento, rentabilidad, actividad, alertas y 3–5 acciones.")
-    return _gpt(sys, usr, max_tokens=500)
+    sys = (
+        "Eres un consultor financiero. Redacta un resumen ejecutivo en español, "
+        "tono profesional, claro, 8–12 viñetas máximo. Usa Markdown. "
+        "Para fórmulas usa LaTeX con $...$ o $$...$$ cuando ayude. "
+        "Si hay ratios clave (liquidez, endeudamiento, rentabilidad), añade al FINAL "
+        "exactamente UN bloque `chart` con JSON válido para Chart.js comparando esos ratios."
+    )
+    usr = (
+        f"Período: {period or 'no especificado'}\n\n"
+        f"KPIs (JSON):\n{json.dumps(kpis, ensure_ascii=False)}\n\n"
+        "Incluye: liquidez, endeudamiento, rentabilidad, actividad, alertas y 3–5 acciones."
+    )
+    return _gpt(sys, usr, max_tokens=700)
  
 
 # ===================== HTML =====================
@@ -381,6 +400,7 @@ PORTAL_HTML = """
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Portal</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.10/dist/katex.min.css">
 <style>
   body{font-family:system-ui;margin:2rem}
   .card{max-width:1000px;margin:auto;padding:1.2rem 1.5rem;border:1px solid #e5e7eb;border-radius:14px;box-shadow:0 10px 30px rgba(0,0,0,.06)}
@@ -389,6 +409,9 @@ PORTAL_HTML = """
   pre{white-space:pre-wrap;background:#f9fafb;padding:1rem;border-radius:10px;border:1px solid #eee}
   .row{display:flex;gap:12px;flex-wrap:wrap}
   .muted{color:#6b7280}
+  .md h1,.md h2,.md h3{margin:1rem 0 .4rem}
+  .md p,.md li{line-height:1.5}
+  .chartwrap{margin:12px 0}
 </style>
 </head>
 <body>
@@ -411,8 +434,7 @@ PORTAL_HTML = """
     </label>
     <div style="margin-top:8px"><button type="submit">Preguntar</button></div>
   </form>
-  <small class="muted">Puedes hacer hasta 5 preguntas a la vez (una por línea).</small>
-  <pre id="askres"></pre>
+  <div id="askres" class="md"></div>
 
   <hr>
 
@@ -422,14 +444,62 @@ PORTAL_HTML = """
     <small class="muted">Indica meses o años a evaluar. Ej: “2022–2024”, “ene–jun 2024”, “últimos 12 meses”.</small>
     <div style="margin-top:8px"><button>Generar Reporte Automático</button></div>
   </form>
-  <pre id="repres"></pre>
+  <div id="repres" class="md"></div>
 </div>
 
-<!-- Script con validaciones y llamadas -->
+<!-- Librerías para Markdown, sanitización, LaTeX y Chart.js -->
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/katex@0.16.10/dist/katex.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/katex@0.16.10/dist/contrib/auto-render.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+
 <script>
+marked.setOptions({ breaks:true });
+
+function renderMD(el, md){
+  // 1) Intercepta bloques ```chart ...```
+  const charts = [];
+  const replaced = (md || '').replace(/```chart\\s*([\\s\\S]*?)```/g, (m, json) => {
+    try{
+      const cfg = JSON.parse(json);
+      const id = 'ch_' + Math.random().toString(36).slice(2,9);
+      charts.push({id, cfg});
+      return `<div class="chartwrap"><canvas id="${id}"></canvas></div>`;
+    }catch(e){
+      return `<pre>${m.replace(/</g,'&lt;')}</pre>`;
+    }
+  });
+
+  // 2) Markdown → HTML seguro
+  const html = DOMPurify.sanitize(marked.parse(replaced));
+  el.innerHTML = html;
+
+  // 3) Render LaTeX
+  try{
+    renderMathInElement(el, {
+      delimiters: [
+        {left: "$$", right: "$$", display: true},
+        {left: "$",  right: "$",  display: false},
+        {left: "\\(", right: "\\)", display: false},
+        {left: "\\[", right: "\\]", display: true},
+      ],
+      throwOnError: false
+    });
+  }catch(e){ /* ignora errores de fórmulas */ }
+
+  // 4) Pinta Chart.js
+  charts.forEach(c => {
+    const ctx = document.getElementById(c.id)?.getContext('2d');
+    if(ctx){
+      try{ new Chart(ctx, c.cfg); }catch(e){ /* ignora errores de config */ }
+    }
+  });
+}
+
 const MAX_FILES = [MAX_FILES];
-const SINGLE_MAX = [SINGLE_MAX]; // MB por archivo
-const TOTAL_MAX  = [TOTAL_MAX];  // MB por subida
+const SINGLE_MAX = [SINGLE_MAX];
+const TOTAL_MAX  = [TOTAL_MAX];
 
 function toMB(n){ return (n/1024/1024).toFixed(1) + " MB"; }
 
@@ -439,7 +509,7 @@ async function withToken(url,opts={}){
   return fetch(url,opts);
 }
 
-// SUBIR PDFs
+// SUBIR PDFs (igual)
 up.onsubmit = async e => {
   e.preventDefault();
   const input = up.querySelector('input[type=file]');
@@ -465,7 +535,7 @@ up.onsubmit = async e => {
   box.textContent = `HTTP ${r.status}\\n` + await r.text();
 };
 
-// PREGUNTAR (hasta 5 preguntas)
+// PREGUNTAR (hasta 5 preguntas) — ahora renderizamos Markdown + LaTeX + Chart
 askf.onsubmit = async (e) => {
   e.preventDefault();
   const raw = new FormData(askf).get('questions') || '';
@@ -473,33 +543,49 @@ askf.onsubmit = async (e) => {
   const prosa = document.getElementById('prosa')?.checked || false;
 
   const box = document.getElementById('askres');
-  if (!list.length) { box.textContent = 'Escribe al menos 1 pregunta (una por línea).'; return; }
+  renderMD(box, '_Consultando..._');
 
-  box.textContent = 'Consultando...';
   try {
     const r = await withToken('/ask', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({ questions: list, top_k: 6, prosa })
     });
-    const body = await r.text();
-    box.textContent = `HTTP ${r.status}\\n${body}`;
+    const text = await r.text();
+    try{
+      const data = JSON.parse(text);
+      const md = (data.results || []).map((it, i) => {
+        const src = (it.sources||[]).map(s => `- ${s.doc_title} (p.${s.page}, score ${s.score})`).join('\\n') || '- s/d';
+        return `### Pregunta ${i+1}\n**${it.question}**\n\n${it.answer_markdown}\n\n**Fuentes**\\n${src}`;
+      }).join('\\n\\n---\\n\\n');
+      renderMD(box, `HTTP ${r.status}\\n\\n` + md);
+    }catch(parseErr){
+      renderMD(box, '```\n' + `HTTP ${r.status}\n` + text + '\n```');
+    }
   } catch (err) {
-    box.textContent = 'ERROR de red: ' + err;
+    renderMD(box, 'ERROR de red: ' + String(err));
   }
 };
 
-// REPORTE
+// REPORTE — renderiza Markdown + LaTeX + Chart
 rep.onsubmit = async e => {
   e.preventDefault();
   const periodo = new FormData(rep).get('periodo') || '';
   const box = document.getElementById('repres');
+  renderMD(box, '_Generando reporte..._');
+
   const r = await withToken('/report',{
     method:'POST',
     headers:{'Content-Type':'application/json'},
     body: JSON.stringify({period: periodo})
   });
-  box.textContent = `HTTP ${r.status}\\n` + await r.text();
+  const text = await r.text();
+  try{
+    const data = JSON.parse(text);
+    renderMD(box, `HTTP ${r.status}\\n\\n` + (data.report_markdown || ''));
+  }catch(e){
+    renderMD(box, '```\n' + `HTTP ${r.status}\n` + text + '\n```');
+  }
 };
 </script>
 </body>
