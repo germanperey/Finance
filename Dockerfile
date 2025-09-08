@@ -1,18 +1,20 @@
 FROM python:3.11-slim
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 WORKDIR /app
 
-# FAISS necesita libgomp (OpenMP)
-RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 && rm -rf /var/lib/apt/lists/*
+# FAISS necesita OpenMP
+RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 \
+  && rm -rf /var/lib/apt/lists/*
 
-# instala dependencias
+# dependencias
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# copia TODO (incluye templates/, static/, etc.)
+# copia código
 COPY . .
 
-# Render provee PORT
+# Render inyecta PORT
 EXPOSE 10000
 
-# FastAPI con Gunicorn 
-CMD ["bash","-lc","gunicorn app:app --bind 0.0.0.0:${PORT}"]
+# Arranque: usa el PORT de Render, 1 worker (free tier) y timeout alto para cold start
+CMD ["bash","-lc","gunicorn app:app --bind 0.0.0.0:${PORT} --workers 1 --timeout 120"]
