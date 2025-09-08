@@ -37,6 +37,9 @@ from fastapi.responses import HTMLResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic_settings import BaseSettings
 from jose import jwt, JWTError
+from zipfile import ZipFile
+import tempfile
+import aiohttp
 
 # ===================== Config =====================
 class Settings(BaseSettings):
@@ -271,37 +274,51 @@ def _gpt(system_msg: str, user_msg: str, max_tokens: int = 700) -> str | None:
 
 def premium_answer_for_question(question: str, ctx: list[dict]) -> str:
     """
-    Redacción clara y accionable a partir de los fragmentos (ctx).
-    - Usa Markdown.
-    - Si necesitas fórmulas, usa LaTeX con $...$ o $$...$$.
-    - Si hay 2+ métricas comparables, añade AL FINAL un bloque de código `chart`
-      con JSON válido para Chart.js.
+    Redacción clara con DEFINICIONES + DIAGNÓSTICO + RECOMENDACIONES.
+    Usa solo la evidencia (ctx). Devuelve Markdown.
+    Si la llamada a GPT falla, cae a diagnóstico local.
     """
-    # evidencia (top-5)
+    # evidencia (top-6)
     snips = []
-    for c in (ctx or [])[:5]:
+    for c in (ctx or [])[:6]:
         doc = c.get("doc_title","?"); pg = c.get("page","?"); tx = c.get("text","")
         snips.append(f"[{doc} p.{pg}] {tx}")
     evidence = "\n\n".join(snips) or "(sin evidencia)"
 
     sys = (
-        "Eres un analista financiero senior. Responde en español, claro y conciso, usando Markdown. "
-        "Cuando sea útil, escribe fórmulas con LaTeX (delimitadores $...$ o $$...$$). "
-        "Si detectas 2 o más métricas numéricas comparables, agrega al FINAL exactamente "
-        "UN bloque de código con encabezado 'chart' que contenga JSON válido para Chart.js. "
-        "No inventes datos fuera de la evidencia; si faltan, dilo."
+        "Eres un analista financiero senior que escribe en español. "
+        "Estructura SIEMPRE tu salida con estos apartados: "
+        "1) **Definiciones clave** (explica brevemente cada concepto mencionado en la pregunta o la evidencia: liquidez, endeudamiento, margen, EBITDA, etc.). "
+        "2) **Diagnóstico** (evalúa si los factores son buenos/regulares/malos; justifica con umbrales típicos o comparaciones relativas a la evidencia; sé prudente si faltan datos). "
+        "3) **Recomendaciones** (acciones concretas, priorizadas y medibles; separa corto/mediano plazo). "
+        "4) **Riesgos/alertas** (señales que vigilar). "
+        "Usa Markdown, tono claro, sin inventar cifras fuera de la evidencia."
     )
     usr = (
         f"Pregunta:\n{question}\n\n"
-        f"Evidencia (usa SOLO estos datos):\n{evidence}\n\n"
-        "Devuelve, en este orden:\n"
-        "1) Resumen ejecutivo (3–4 líneas).\n"
-        "2) Hallazgos clave (viñetas, con cifras si aparecen).\n"
-        "3) Recomendaciones accionables (viñetas) y riesgos/alertas.\n"
-        "4) (Opcional) Un bloque `chart` con JSON válido si hay suficientes números para comparar.\n"
+        f"Evidencia permitida (usa SOLO esto):\n{evidence}\n\n"
+        "Formato:\n"
+        "### Definiciones clave\n"
+        "- ...\n\n"
+        "### Diagnóstico\n"
+        "- ...\n\n"
+        "### Recomendaciones (prioridad)\n"
+        "- [P1] ...\n- [P2] ...\n\n"
+        "### Riesgos / alertas\n"
+        "- ...\n"
     )
-    out = _gpt(sys, usr, max_tokens=900)
-    return out or "Pasajes más relevantes (ver 'evidence')."
+    # Llamada a GPT
+    if not _premium_on():
+        # si no hay API key, usa la vía local
+        return rule_based_advice_from_ctx(question, ctx) or "No hay suficientes datos para responder."
+    try:
+        out = _gpt(sys, usr, max_tokens=900)
+        if out: 
+            return out
+        # si vino vacío, usa fallback local
+        return rule_based_advice_from_ctx(question, ctx) or "No hay suficientes datos para responder."
+    except Exception:
+        return rule_based_advice_from_ctx(question, ctx) or "No hay suficientes datos para responder."
 
 
 def premium_exec_summary(period: str, kpis: dict) -> str | None:
@@ -810,6 +827,51 @@ async def upload(
     }
 
 
+@app.post("/upload-zip")
+async def upload_zip(request: Request, background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+    uid = require_user(request)
+    base = user_dir(uid); ensure_dirs(base)
+
+    if not file.filename.lower().endswith(".zip"):
+        raise HTTPException(400, "Sube un .zip con PDFs")
+
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+    tmp.write(await file.read()); tmp.close()
+
+    extracted = []
+    with ZipFile(tmp.name, 'r') as z:
+        for nm in z.namelist():
+            if nm.lower().endswith(".pdf"):
+                dest = base/"docs"/Path(nm).name
+                with z.open(nm) as src, open(dest, "wb") as out:
+                    shutil.copyfileobj(src, out)
+                extracted.append(dest.name)
+
+    background_tasks.add_task(index_worker, str(base), extracted)
+    return {"ok": True, "saved": extracted, "indexing": "in_progress"}
+
+@app.post("/ingest/url")
+async def ingest_from_urls(request: Request, background_tasks: BackgroundTasks, body: Dict[str, Any]):
+    uid = require_user(request)
+    base = user_dir(uid); ensure_dirs(base)
+    urls = body.get("urls") or []
+    if not isinstance(urls, list) or not urls:
+        raise HTTPException(400, "Incluye 'urls': [ ... ] con enlaces a PDFs")
+    saved = []
+    async with aiohttp.ClientSession() as ses:
+        for u in urls:
+            if not str(u).lower().endswith(".pdf"):
+                continue
+            fn = base/"docs"/Path(u).name
+            async with ses.get(u) as r:
+                if r.status == 200:
+                    with open(fn, "wb") as out:
+                        out.write(await r.read())
+                    saved.append(fn.name)
+    background_tasks.add_task(index_worker, str(base), saved)
+    return {"ok": True, "saved": saved, "indexing": "in_progress"}
+
+
 @app.get("/status")
 def status(request: Request):
     uid = require_user(request)
@@ -886,6 +948,142 @@ def summarize_answer(question: str, res) -> str:
 
     return "\n".join(out)
 
+def _pretty_pct(x):
+    return f"{x*100:.1f}%" if isinstance(x,(int,float)) else "s/d"
+
+def _band(value, low=None, high=None, reverse=False):
+    """
+    Clasifica simple: bajo/medio/alto según umbrales.
+    reverse=True cuando "más bajo es mejor" (ej: endeudamiento).
+    Devuelve ('bueno'|'aceptable'|'riesgo', comentario)
+    """
+    if value is None:
+        return "s/d", "Sin dato."
+    if low is None and high is None:
+        return "s/d", "Sin umbrales de referencia."
+    if reverse:
+        # bajo=bueno
+        if high is not None and value > high: return "riesgo", f"Alto ({value:.2f})"
+        if low is not None and value > low:  return "aceptable", f"Medio ({value:.2f})"
+        return "bueno", f"Bajo ({value:.2f})"
+    else:
+        # alto=bueno
+        if low is not None and value < low:  return "riesgo", f"Bajo ({value:.2f})"
+        if high is not None and value < high: return "aceptable", f"Medio ({value:.2f})"
+        return "bueno", f"Alto ({value:.2f})"
+
+def rule_based_advice_from_kpis(k: dict) -> str:
+    """Diagnóstico + recomendaciones a partir de KPIs extraídos del PDF."""
+    if not k:
+        return ""
+    out = []
+    out.append("### Definiciones clave")
+    out += [
+        "- **Liquidez (Razón Corriente)**: capacidad de cubrir pasivos de corto plazo con activos corrientes.",
+        "- **Prueba Ácida**: liquidez descontando inventarios ((Activos corrientes − Inventario) / Pasivos corrientes).",
+        "- **Margen Bruto/Operacional/Neto**: utilidad como % de ventas en cada nivel.",
+        "- **Endeudamiento (Deuda/Activos; Deuda/Patrimonio)**: apalancamiento financiero.",
+        "- **Cobertura de Intereses (EBIT/Intereses)**: cuántas veces cubres los intereses.",
+        "- **Rotación de Activos (Ventas/Activos)**: eficiencia comercial vs. base de activos.",
+    ]
+
+    cr  = k.get("current_ratio")
+    qa  = k.get("quick_ratio")
+    gm  = k.get("gross_margin")
+    om  = k.get("operating_margin")
+    nm  = k.get("net_margin")
+    dr  = k.get("debt_ratio")
+    dte = k.get("debt_to_equity")
+    ic  = k.get("interest_coverage")
+    at  = k.get("asset_turnover")
+
+    # Umbrales orientativos
+    diag = []
+    band_cr, cmt_cr = _band(cr, low=1.0, high=1.5, reverse=False); diag.append(f"- **Razón Corriente**: {cr if cr is not None else 's/d'} → {band_cr} ({cmt_cr})")
+    band_qa, cmt_qa = _band(qa, low=0.8, high=1.0, reverse=False); diag.append(f"- **Prueba Ácida**: {qa if qa is not None else 's/d'} → {band_qa} ({cmt_qa})")
+    band_gm, cmt_gm = _band(gm, low=0.20, high=0.35, reverse=False); diag.append(f"- **Margen Bruto**: {_pretty_pct(gm)} → {band_gm} ({cmt_gm})")
+    band_om, cmt_om = _band(om, low=0.05, high=0.15, reverse=False); diag.append(f"- **Margen Operacional**: {_pretty_pct(om)} → {band_om} ({cmt_om})")
+    band_nm, cmt_nm = _band(nm, low=0.03, high=0.10, reverse=False); diag.append(f"- **Margen Neto**: {_pretty_pct(nm)} → {band_nm} ({cmt_nm})")
+    band_dr, cmt_dr = _band(dr, low=0.50, high=0.70, reverse=True);  diag.append(f"- **Deuda/Activos**: {_pretty_pct(dr) if isinstance(dr,float) else dr} → {band_dr} ({cmt_dr})")
+    band_de, cmt_de = _band(dte, low=1.5,  high=2.5,  reverse=True);  diag.append(f"- **Deuda/Patrimonio**: {dte if dte is not None else 's/d'} → {band_de} ({cmt_de})")
+    band_ic, cmt_ic = _band(ic, low=1.5,  high=3.0,  reverse=False); diag.append(f"- **Cobertura de Intereses**: {ic if ic is not None else 's/d'} → {band_ic} ({cmt_ic})")
+    band_at, cmt_at = _band(at, low=0.6,  high=1.0,  reverse=False); diag.append(f"- **Rotación de Activos**: {at if at is not None else 's/d'} → {band_at} ({cmt_at})")
+
+    out.append("\n### Diagnóstico")
+    out += diag
+
+    rec = []
+    if band_cr in ("riesgo","aceptable") or band_qa in ("riesgo","aceptable"):
+        rec += [
+            "- **Liquidez**: acelerar cobros (descuentos por pronto pago), revisar crédito, reducir inventario lento, negociar plazos con proveedores.",
+            "- Pausar CAPEX/opex no críticos hasta normalizar capital de trabajo."
+        ]
+    if band_de in ("riesgo","aceptable") or band_dr in ("riesgo","aceptable"):
+        rec += [
+            "- **Apalancamiento**: amortizar deuda cara, alargar plazos a menor tasa, evaluar capitalización de utilidades.",
+        ]
+    if band_om in ("riesgo","aceptable") or band_nm in ("riesgo","aceptable"):
+        rec += [
+            "- **Margen**: ajustes de precios selectivos, optimizar mix, compras/mermas, eficiencia operativa.",
+        ]
+    if band_ic in ("riesgo","aceptable"):
+        rec += [
+            "- **Cobertura de intereses**: renegociar deuda y elevar EBIT con foco en contribución marginal."
+        ]
+    if not rec:
+        rec = ["- Mantener disciplina de costos y rotación; monitorear mensualmente KPIs clave."]
+
+    out.append("\n### Recomendaciones (prioridad)")
+    for i, r in enumerate(rec, 1):
+        out.append(f"- [P{i}] {r}")
+
+    out.append("\n### Riesgos / alertas")
+    out += [
+        "- Concentración de ventas/clientes, shocks de tasa/FX, dependencia de insumos clave.",
+        "- Calidad de datos: algunos KPIs no estaban disponibles en los PDFs."
+    ]
+
+    return "\n".join(out)
+
+def rule_based_advice_from_ctx(question: str, ctx: list[dict]) -> str:
+    """
+    Usa pasajes (ctx) como evidencia y entrega explicación/diagnóstico simple
+    cuando no tenemos KPIs suficientes. Devuelve Markdown.
+    """
+    if not ctx:
+        return "No hay suficiente evidencia en tus PDFs para responder esa pregunta."
+
+    # Tomamos hasta 4 pasajes relevantes como 'evidencia'
+    bullets = []
+    for c in ctx[:4]:
+        doc = c.get("doc_title","?")
+        pg  = c.get("page","?")
+        tx  = (c.get("text","") or "").strip().replace("\n"," ")
+        if len(tx) > 300:
+            tx = tx[:300] + "…"
+        bullets.append(f"- [{doc} p.{pg}] {tx}")
+
+    md = []
+    md.append("### Definiciones clave")
+    md.append("- *Liquidez*: capacidad para cumplir obligaciones de corto plazo.")
+    md.append("- *Endeudamiento*: proporción de deuda sobre activos/patrimonio.")
+    md.append("- *Márgenes*: utilidad como % de ventas (bruto/operacional/neto).")
+    md.append("- *Cobertura de intereses*: EBIT dividido por gastos financieros.")
+
+    md.append("\n### Diagnóstico (basado en evidencia)")
+    md.append("Los pasajes más relevantes para tu pregunta son:")
+    md += bullets
+
+    md.append("\n### Recomendaciones (prioridad)")
+    md.append("- [P1] Revisa capital de trabajo: acelerar cobros y optimizar inventarios.")
+    md.append("- [P2] Si el apalancamiento es alto, renegocia tasas/plazos y prioriza deuda cara.")
+    md.append("- [P3] Mejora margen: precios/mix/mermas y eficiencia operativa.")
+
+    md.append("\n### Riesgos / alertas")
+    md.append("- Concentración de clientes, variación de tasas/FX y dependencia de insumos.")
+
+    return "\n".join(md)
+
 
 @app.post("/ask")
 async def ask(request: Request, body: Dict[str, Any]):
@@ -916,8 +1114,10 @@ async def ask(request: Request, body: Dict[str, Any]):
         if prosa and _premium_on():
             answer = premium_answer_for_question(query, ctx)
         else:
-            # Resumen heurístico local (sin GPT)
-            answer = summarize_answer(query, res)
+            # Motor local que explica + diagnostica + recomienda
+            answer = rule_based_advice_from_ctx(query, ctx)
+
+
 
         sources = _mk_sources(res, n=5)
 
@@ -1124,6 +1324,11 @@ async def report(request: Request, body: Dict[str, Any]):
     result_md = "\n".join(lines)
     if executive_summary:
         result_md = "## Resumen Ejecutivo (IA)\n" + executive_summary + "\n\n" + result_md
+    
+    # Añade diagnóstico local (definiciones + evaluación + recomendaciones)
+    diag_md = rule_based_advice_from_kpis(k)
+    if diag_md:
+        result_md += "\n\n---\n\n" + diag_md
 
     return {
         "kpis": k,

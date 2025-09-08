@@ -12,6 +12,6 @@ pdfplumber>=0.11
 sentence-transformers>=2.7
 openai>=1.40.0
 python-multipart
-
+aiohttp
 
 
