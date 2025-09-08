@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import List, Dict, Any, Tuple
 
 import mercadopago
-from fastapi import FastAPI, Request, UploadFile, File, HTTPException
+from fastapi import FastAPI, Request, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic_settings import BaseSettings
@@ -542,11 +542,26 @@ def require_user(request: Request) -> str:
 from fastapi import BackgroundTasks
 from typing import Optional
 
+
+def index_worker(base_dir: str, filenames: list[str]):
+    """Se ejecuta en segundo plano: abre y agrega PDFs al índice."""
+    try:
+        base = Path(base_dir)
+        pdfs = [base/"docs"/fn for fn in filenames]
+        print(f"[index_worker] iniciando, archivos={filenames}", flush=True)
+        fragments = add_pdfs_to_index(base, pdfs)
+        print(f"[index_worker] listo, fragments_indexed={fragments}", flush=True)
+    except Exception as e:
+        print(f"[index_worker] ERROR: {e}", flush=True)
+
+
+from typing import Optional
+
 @app.post("/upload")
 async def upload(
     request: Request,
     background_tasks: BackgroundTasks,
-    files: Optional[List[UploadFile]] = File(None)
+    files: Optional[List[UploadFile]] = File(None),
 ):
     uid = require_user(request)
     base = user_dir(uid); ensure_dirs(base)
@@ -561,37 +576,32 @@ async def upload(
         return {"ok": False, "message": f"Máximo {max_files} PDFs por subida."}
 
     total_size = 0
-    saved: List[Path] = []
-    errors: List[str] = []
-
+    saved_names: List[str] = []
     for f in files:
-        fn = (f.filename or "archivo.pdf").strip()
-        if not fn.lower().endswith(".pdf"):
-            errors.append(f"{fn}: solo se aceptan PDF")
-            continue
-        content = await f.read()
+        name = (f.filename or "archivo.pdf").strip()
+        if not name.lower().endswith(".pdf"):
+            return {"ok": False, "message": f"{name}: solo se aceptan PDF"}
+        content = await f.read()                     # SOLO guardamos; nada pesado aquí
         total_size += len(content)
         if len(content) > single_max:
-            errors.append(f"{fn}: supera {settings.SINGLE_FILE_MAX_MB} MB")
-            continue
-        dest = base/"docs"/fn
-        with open(dest, "wb") as out:
+            return {"ok": False, "message": f"{name}: supera {settings.SINGLE_FILE_MAX_MB} MB"}
+        with open(base/"docs"/name, "wb") as out:
             out.write(content)
-        saved.append(dest)
+        saved_names.append(name)
 
     if total_size > total_max:
-        for p in saved:
-            try: p.unlink(missing_ok=True)
+        for nm in saved_names:
+            try: (base/"docs"/nm).unlink(missing_ok=True)
             except: pass
         return {"ok": False, "message": f"Superaste el total permitido ({settings.MAX_TOTAL_MB} MB por subida)."}
 
-    # 👉 indexación en SEGUNDO PLANO (la respuesta sale al tiro)
-    if saved:
-        background_tasks.add_task(add_pdfs_to_index, base, saved)
+    # 👉 La indexación pesada se hace en segundo plano (evita el 502/504)
+    background_tasks.add_task(index_worker, str(base), saved_names)
 
     return {
         "ok": True,
-        "saved": [p.name for p in saved],
+        "saved": saved_names,
+        "errors": [],
         "indexing": "in_progress",
         "note": "Estamos procesando tus PDFs en segundo plano."
     }
