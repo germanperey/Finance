@@ -28,7 +28,7 @@ from __future__ import annotations
 import os, re, json, hashlib, shutil
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 
 import mercadopago
 from fastapi import FastAPI, Request, UploadFile, File, HTTPException, BackgroundTasks
@@ -47,6 +47,9 @@ class Settings(BaseSettings):
     JWT_SECRET: str
     BASE_URL: str = "http://localhost:8000"
     APP_NAME: str = "Asesor Financiero 1‑día"
+
+    OPENAI_API_KEY: str | None = None
+    OPENAI_MODEL: str = "gpt-4o-mini"
 
     STORAGE_DIR: str = "storage"
     MODEL_NAME: str = "intfloat/multilingual-e5-small"
@@ -237,6 +240,76 @@ def read_token(token: str) -> str:
     except JWTError:
         raise HTTPException(status_code=401, detail="Token inválido o expirado")
 
+
+# =============== PROSA PREMIUM (opcional, requiere OPENAI_API_KEY) ===============
+def _premium_on() -> bool:
+    try:
+        return bool(getattr(settings, "OPENAI_API_KEY", None))
+    except Exception:
+        return False
+
+def _gpt(system_msg: str, user_msg: str, max_tokens: int = 700) -> str | None:
+    """Llama a GPT si hay API key. Devuelve texto o None si algo falla."""
+    if not _premium_on():
+        return None
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=settings.OPENAI_API_KEY)  # usa timeout por defecto
+        resp = client.chat.completions.create(
+            model=getattr(settings, "OPENAI_MODEL", "gpt-4o-mini"),
+            temperature=0.2,
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user",   "content": user_msg},
+            ],
+            max_tokens=max_tokens,
+        )
+        return (resp.choices[0].message.content or "").strip()
+    except Exception:
+        return None
+
+def premium_answer_for_question(question: str, ctx: list[dict]) -> str:
+    """
+    Redacción clara y accionable a partir de los fragmentos (ctx).
+    Si GPT no está disponible, devuelve fallback corto.
+    """
+    # arma evidencia corta con top-5 pasajes
+    snips = []
+    for c in (ctx or [])[:5]:
+        doc = c.get("doc_title","?"); pg = c.get("page","?"); tx = c.get("text","")
+        snips.append(f"[{doc} p.{pg}] {tx}")
+    evidence = "\n\n".join(snips) or "(sin evidencia)"
+
+    sys = ("Eres un analista financiero senior. Escribe en español, muy claro y conciso. "
+           "Estructura en secciones con viñetas y subtítulos. No inventes datos.")
+    usr = (f"Pregunta del usuario:\n{question}\n\n"
+           f"Fragmentos del informe (usa SOLO estos datos como evidencia):\n{evidence}\n\n"
+           "Devuelve:\n"
+           "- Resumen ejecutivo (3–4 líneas).\n"
+           "- Hallazgos clave (viñetas, con cifras si aparecen).\n"
+           "- Recomendaciones accionables (viñetas).\n"
+           "- Riesgos/alertas si aplica.")
+    out = _gpt(sys, usr, max_tokens=700)
+    return out or "Pasajes más relevantes (ver 'evidence')."
+
+def premium_exec_summary(period: str, kpis: dict) -> str | None:
+    """
+    Crea un ‘resumen ejecutivo’ del reporte a partir de KPIs extraídos.
+    Devuelve None si GPT no está disponible.
+    """
+    if not _premium_on():
+        return None
+    # compacta KPIs numéricos que ya calculaste
+    import json
+    sys = ("Eres un consultor financiero. Redacta un resumen ejecutivo en español, "
+           "con tono profesional, claro, en 8–12 viñetas máximo. No inventes.")
+    usr = (f"Período: {period or 'no especificado'}\n\n"
+           "KPIs y cálculos disponibles (JSON):\n"
+           f"{json.dumps(kpis, ensure_ascii=False)}\n\n"
+           "Incluye: liquidez, endeudamiento, rentabilidad, actividad, alertas y 3–5 acciones.")
+    return _gpt(sys, usr, max_tokens=500)
+ 
+
 # ===================== HTML =====================
 BASE_HTML = """<!doctype html>
 <html lang="es">
@@ -330,14 +403,15 @@ PORTAL_HTML = """
   </form>
   <pre id="upres"></pre>
 
-  <hr>
-
   <!-- PREGUNTAS (hasta 5 a la vez) -->
   <form id="askf">
     <textarea name="questions" rows="4" placeholder="Escribe hasta 5 preguntas, una por línea"></textarea>
-    <div style="margin-top:8px"><button>Preguntar</button></div>
+    <label style="display:inline-flex;gap:6px;align-items:center;margin-top:8px">
+      <input type="checkbox" id="prosa"> Prosa premium (IA)
+    </label>
+    <div style="margin-top:8px"><button type="submit">Preguntar</button></div>
   </form>
-  <small class="muted">Puedes hacer hasta 5 preguntas en paralelo para el mismo reporte.</small>
+  <small class="muted">Puedes hacer hasta 5 preguntas a la vez (una por línea).</small>
   <pre id="askres"></pre>
 
   <hr>
@@ -391,20 +465,28 @@ up.onsubmit = async e => {
   box.textContent = `HTTP ${r.status}\\n` + await r.text();
 };
 
-// PREGUNTAS (hasta 5)
-askf.onsubmit = async e => {
+// PREGUNTAR (hasta 5 preguntas)
+askf.onsubmit = async (e) => {
   e.preventDefault();
   const raw = new FormData(askf).get('questions') || '';
-  const list = raw.split(/\\r?\\n/).map(x=>x.trim()).filter(Boolean).slice(0,5);
-  const box = document.getElementById('askres');
-  if (!list.length) { box.textContent = "Escribe al menos 1 pregunta (una por línea)."; return; }
+  const list = raw.split(/\\r?\\n/).map(s => s.trim()).filter(Boolean).slice(0, 5);
+  const prosa = document.getElementById('prosa')?.checked || false;
 
-  const r = await withToken('/ask',{
-    method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({questions: list, top_k: 6})
-  });
-  box.textContent = `HTTP ${r.status}\\n` + await r.text();
+  const box = document.getElementById('askres');
+  if (!list.length) { box.textContent = 'Escribe al menos 1 pregunta (una por línea).'; return; }
+
+  box.textContent = 'Consultando...';
+  try {
+    const r = await withToken('/ask', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ questions: list, top_k: 6, prosa })
+    });
+    const body = await r.text();
+    box.textContent = `HTTP ${r.status}\\n${body}`;
+  } catch (err) {
+    box.textContent = 'ERROR de red: ' + err;
+  }
 };
 
 // REPORTE
@@ -530,7 +612,6 @@ async def portal():
 #     return {"received": True}
 
 # ===================== Rutas protegidas =====================
-from fastapi import Depends
 
 def require_user(request: Request) -> str:
     auth = request.headers.get("Authorization", "")
@@ -538,9 +619,6 @@ def require_user(request: Request) -> str:
         raise HTTPException(401, "Falta token")
     token = auth.split(" ",1)[1]
     return read_token(token)
-
-from fastapi import BackgroundTasks
-from typing import Optional
 
 
 def index_worker(base_dir: str, filenames: list[str]):
@@ -554,8 +632,6 @@ def index_worker(base_dir: str, filenames: list[str]):
     except Exception as e:
         print(f"[index_worker] ERROR: {e}", flush=True)
 
-
-from typing import Optional
 
 @app.post("/upload")
 async def upload(
@@ -615,30 +691,118 @@ def status(request: Request):
     return {"fragments": idx.ntotal, "docs": len({m['doc_title'] for m in meta})}
 
 
+import re as _re2
+
+def _mk_sources(res, n=5):
+    out = []
+    for s, m in res[:n]:
+        out.append({"doc_title": m["doc_title"], "page": m["page"], "score": round(float(s), 2)})
+    return out
+
+def summarize_answer(question: str, res) -> str:
+    """
+    Resumen heurístico en español a partir de los mejores pasajes.
+    No usa APIs externas.
+    """
+    # Une los 6 mejores trozos de texto
+    texts = [m["text"] for _, m in res[:6] if "text" in m]
+    blob = " ".join(texts)
+
+    # Oraciones
+    sents = _re2.split(r"(?<=[\.\!\?])\s+", blob)
+    # Palabras gatillo típicas de informe financiero
+    kws = ["Aumente", "Reduzca", "Mejore", "Optimice", "Cuidado",
+           "Liquidez", "Endeudamiento", "Rentabilidad", "EBITDA",
+           "Margen", "Inventario", "Cuentas por cobrar", "Cuentas por pagar",
+           "Capital de Trabajo", "Equilibrio", "Tesorería"]
+
+    bullets = []
+    for kw in kws:
+        for s in sents:
+            if kw.lower() in s.lower():
+                bullets.append(s.strip())
+    # Quita duplicados y limita
+    seen = set(); clean = []
+    for b in bullets:
+        if b not in seen:
+            seen.add(b); clean.append(b)
+    if not clean:
+        # si no detectó recomendaciones, toma 3 frases representativas
+        clean = [s.strip() for s in sents[:3]]
+
+    # Arma respuesta
+    out = []
+    out.append("### Resumen")
+    for b in clean[:8]:
+        out.append(f"- {b}")
+
+    # Señales rápidas (si aparecen números)
+    def grab(rx):
+        m = _re2.search(rx, blob, flags=_re2.IGNORECASE)
+        return m.group(0) if m else None
+
+    ebitda = grab(r"EBITDA[^0-9\-]*[-\$\s]*[\d\.\,]+")
+    margen = grab(r"Margen\s+\w+[^0-9\-]*[-\%\s]*[\d\.\,]+%")
+    deuda  = grab(r"(Deuda/Activos|Deuda/Patrimonio|Ratio de Endeudamiento)[^%]*\d[\d\.\,]*%?")
+    if any([ebitda, margen, deuda]):
+        out.append("\n### Indicadores detectados")
+        if ebitda: out.append(f"- {ebitda}")
+        if margen: out.append(f"- {margen}")
+        if deuda:  out.append(f"- {deuda}")
+
+    # Recomendaciones (heurística)
+    recs = [s for s in sents if any(w in s.lower() for w in ["aument", "reduzc", "mejor", "optim", "equilibr"])]
+    if recs:
+        out.append("\n### Recomendaciones")
+        for r in recs[:6]:
+            out.append(f"- {r.strip()}")
+
+    return "\n".join(out)
+
+
 @app.post("/ask")
 async def ask(request: Request, body: Dict[str, Any]):
     uid = require_user(request)
     base = user_dir(uid)
     top_k = int(body.get("top_k", settings.TOP_K))
+    prosa = bool(body.get("prosa", False))
 
-    # Soporta "question" (string) o "questions" (lista)
     q = body.get("questions") or body.get("question") or []
-    if isinstance(q, str): queries = [q]
-    else: queries = [str(x) for x in q][:5]
-    queries = [x.strip() for x in queries if x and x.strip()]
+    if isinstance(q, str):
+        # admite varias líneas en una caja de texto
+        queries = [x.strip() for x in q.splitlines() if x.strip()]
+    else:
+        queries = [str(x).strip() for x in q][:5]
 
     if not queries:
         raise HTTPException(400, "Falta 'questions' o 'question'")
 
-    out = []
+    results = []
     for query in queries:
-        res = semantic_search(base, query, top_k)
-        ctx = [{"score": round(s,3), **m} for s,m in res]
-        evidence = "\n\n".join([f"[Fuente: {c['doc_title']} p.{c['page']}]\n{c['text']}" for c in ctx])
-        out.append({"question": query, "context": ctx, "evidence": evidence,
-                    "answer": "Pasajes más relevantes (ver 'evidence')."})
+        # Busca pasajes relevantes
+        res = semantic_search(base, query, top_k)  # [(score, meta), ...]
 
-    return {"results": out}
+        # Preparamos el contexto para ambas modalidades
+        ctx = [{"score": round(float(s), 3), **m} for s, m in res]
+
+        # Si el usuario activó "prosa" y hay API key → usa Prosa Premium
+        if prosa and _premium_on():
+            answer = premium_answer_for_question(query, ctx)
+        else:
+            # Resumen heurístico local (sin GPT)
+            answer = summarize_answer(query, res)
+
+        sources = _mk_sources(res, n=5)
+
+        results.append({
+            "question": query,
+            "answer_markdown": answer,   # siempre devolvemos Markdown
+            "sources": sources,
+            "prosa_premium": bool(prosa and _premium_on())
+        })
+
+    return {"results": results}
+
 
 # ---- KPI extractor (igual que antes, simplificado) ----
 import re as _re
@@ -827,11 +991,22 @@ async def report(request: Request, body: Dict[str, Any]):
     if not tips: tips.append("Los datos son parciales; sube estados más detallados para un diagnóstico profundo.")
     lines += [f"- {t}" for t in tips]
 
-    return {"kpis": k, "report_markdown": "\n".join(lines)}
+    # ----- Resumen ejecutivo (opcional con GPT) -----
+    executive_summary = premium_exec_summary(period, k)  # devuelve None si no hay OPENAI_API_KEY
+
+    result_md = "\n".join(lines)
+    if executive_summary:
+        result_md = "## Resumen Ejecutivo (IA)\n" + executive_summary + "\n\n" + result_md
+
+    return {
+        "kpis": k,
+        "report_markdown": result_md,
+        "executive_summary": executive_summary
+    }
+
 
 
 # Salud
-from fastapi.responses import HTMLResponse, PlainTextResponse
 
 @app.get("/__check_coupon")
 def __check_coupon():
@@ -839,7 +1014,6 @@ def __check_coupon():
         "coupon_field_in_template": "name=coupon" in BASE_HTML
     }
 
-from fastapi.responses import PlainTextResponse  # (déjalo importado)
 
 @app.get("/health")
 async def health():
