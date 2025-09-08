@@ -282,7 +282,11 @@ async function startCheckout(ev){
 
 
 PORTAL_HTML = """
-<!doctype html><html lang=es><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Portal</title>
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Portal</title>
 <style>
   body{font-family:system-ui;margin:2rem}
   .card{max-width:1000px;margin:auto;padding:1.2rem 1.5rem;border:1px solid #e5e7eb;border-radius:14px;box-shadow:0 10px 30px rgba(0,0,0,.06)}
@@ -290,41 +294,43 @@ PORTAL_HTML = """
   button{background:#111;color:#fff;border:none;cursor:pointer}
   pre{white-space:pre-wrap;background:#f9fafb;padding:1rem;border-radius:10px;border:1px solid #eee}
   .row{display:flex;gap:12px;flex-wrap:wrap}
-  small{color:#6b7280}
+  .muted{color:#6b7280}
 </style>
-</head><body>
-<div class=card>
+</head>
+<body>
+<div class="card">
   <h2>Portal de usuario (pase activo)</h2>
 
   <!-- SUBIR PDFs -->
-  <form id=up method=post enctype=multipart/form-data>
-    <input type=file name=files multiple accept=application/pdf required>
+  <form id="up" method="post" enctype="multipart/form-data">
+    <input type="file" name="files" multiple accept="application/pdf" required>
+    <small class="muted">Límites: máx <b>[MAX_FILES]</b> PDFs por subida · <b>[SINGLE_MAX] MB</b> cada uno · hasta <b>[TOTAL_MAX] MB</b> en total.</small>
     <div style="margin-top:8px"><button>Subir PDFs e indexar</button></div>
   </form>
-  <small>Máximo {settings.MAX_UPLOAD_FILES} PDF por subida. Límite: {settings.SINGLE_FILE_MAX_MB} MB c/u y {settings.MAX_TOTAL_MB} MB en total.</small>
-  <pre id=upres></pre>
+  <pre id="upres"></pre>
 
   <hr>
 
-  <!-- PREGUNTAR (hasta 5) -->
-  <form id=askf>
-    <textarea name=questions rows="4" placeholder="Escribe hasta 5 preguntas, una por línea"></textarea>
+  <!-- PREGUNTAS (hasta 5 a la vez) -->
+  <form id="askf">
+    <textarea name="questions" rows="4" placeholder="Escribe hasta 5 preguntas, una por línea"></textarea>
     <div style="margin-top:8px"><button>Preguntar</button></div>
   </form>
-  <small>Puedes hacer hasta 5 preguntas a la vez (una por línea).</small>
-  <pre id=askres></pre>
+  <small class="muted">Puedes hacer hasta 5 preguntas en paralelo para el mismo reporte.</small>
+  <pre id="askres"></pre>
 
   <hr>
 
   <!-- REPORTE -->
-  <form id=rep>
-    <input name=periodo placeholder="Período (opcional)">
-    <small>Ejemplos: “2022–2025”, “enero–junio 2024”, “últimos 12 meses”.</small>
+  <form id="rep">
+    <input name="periodo" placeholder="Período (opcional)">
+    <small class="muted">Indica meses o años a evaluar. Ej: “2022–2024”, “ene–jun 2024”, “últimos 12 meses”.</small>
     <div style="margin-top:8px"><button>Generar Reporte Automático</button></div>
   </form>
-  <pre id=repres></pre>
+  <pre id="repres"></pre>
 </div>
 
+<!-- Script con validaciones y llamadas -->
 <script>
 const MAX_FILES = [MAX_FILES];
 const SINGLE_MAX = [SINGLE_MAX]; // MB por archivo
@@ -338,53 +344,65 @@ async function withToken(url,opts={}){
   return fetch(url,opts);
 }
 
+// SUBIR PDFs
 up.onsubmit = async e => {
   e.preventDefault();
   const input = up.querySelector('input[type=file]');
   const files = Array.from(input.files || []);
-  if (!files.length) { upres.textContent = "Selecciona al menos un PDF."; return; }
-  if (files.length > MAX_FILES) { upres.textContent = `Máximo ${MAX_FILES} PDFs por subida.`; return; }
+  const box = document.getElementById('upres');
+
+  if (!files.length) { box.textContent = "Selecciona al menos un PDF."; return; }
+  if (files.length > MAX_FILES) { box.textContent = `Máximo ${MAX_FILES} PDFs por subida.`; return; }
+
   let total = 0;
   for (const f of files) {
     total += f.size;
-    if (!/\.pdf$/i.test(f.name)) { upres.textContent = `${f.name}: solo PDF`; return; }
-    if (f.size > SINGLE_MAX*1024*1024) { upres.textContent = `${f.name} supera ${SINGLE_MAX} MB (${toMB(f.size)})`; return; }
+    if (!/\\.pdf$/i.test(f.name)) { box.textContent = `${f.name}: solo PDF`; return; }
+    if (f.size > SINGLE_MAX*1024*1024) { box.textContent = `${f.name} supera ${SINGLE_MAX} MB (${toMB(f.size)})`; return; }
   }
   if (total > TOTAL_MAX*1024*1024) {
-    upres.textContent = `Superaste el total permitido (${TOTAL_MAX} MB). Subiste ${toMB(total)}.`;
+    box.textContent = `Superaste el total permitido (${TOTAL_MAX} MB). Subiste ${toMB(total)}.`;
     return;
   }
+
   const fd = new FormData(up);
   const r  = await withToken('/upload',{method:'POST',body:fd});
-  upres.textContent = `HTTP ${r.status}\n` + await r.text();
+  box.textContent = `HTTP ${r.status}\\n` + await r.text();
 };
 
+// PREGUNTAS (hasta 5)
 askf.onsubmit = async e => {
   e.preventDefault();
   const raw = new FormData(askf).get('questions') || '';
-  const list = raw.split(/\r?\n/).map(x=>x.trim()).filter(Boolean).slice(0,5);
-  if (!list.length) { askres.textContent = "Escribe al menos 1 pregunta (una por línea)."; return; }
+  const list = raw.split(/\\r?\\n/).map(x=>x.trim()).filter(Boolean).slice(0,5);
+  const box = document.getElementById('askres');
+  if (!list.length) { box.textContent = "Escribe al menos 1 pregunta (una por línea)."; return; }
+
   const r = await withToken('/ask',{
     method:'POST',
     headers:{'Content-Type':'application/json'},
     body: JSON.stringify({questions: list, top_k: 6})
   });
-  askres.textContent = `HTTP ${r.status}\n` + await r.text();
+  box.textContent = `HTTP ${r.status}\\n` + await r.text();
 };
 
+// REPORTE
 rep.onsubmit = async e => {
   e.preventDefault();
   const periodo = new FormData(rep).get('periodo') || '';
+  const box = document.getElementById('repres');
   const r = await withToken('/report',{
     method:'POST',
     headers:{'Content-Type':'application/json'},
     body: JSON.stringify({period: periodo})
   });
-  repres.textContent = `HTTP ${r.status}\n` + await r.text();
+  box.textContent = `HTTP ${r.status}\\n` + await r.text();
 };
 </script>
-</body></html>
+</body>
+</html>
 """
+
 
 # ===================== Rutas públicas =====================
 @app.get("/", response_class=HTMLResponse)
