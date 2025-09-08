@@ -1,16 +1,13 @@
-fastapi
-uvicorn[standard]
-gunicorn
-mercadopago
-python-multipart
-pydantic-settings
-sentence-transformers
-faiss-cpu
-PyMuPDF
-pdfplumber
-numpy
-python-jose[cryptography]
-stripe
-jinja2
-flask
+fastapi>=0.111
+uvicorn[standard]>=0.30
+gunicorn>=21.2  # puedes dejarlo aunque estemos usando uvicorn directo
+pydantic-settings>=2.3
+python-jose[cryptography]>=3.3
 
+mercadopago>=2.2
+numpy>=1.26
+faiss-cpu>=1.7.4
+PyMuPDF>=1.24
+pdfplumber>=0.11
+sentence-transformers>=2.7
+python-multipart
