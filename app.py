@@ -502,7 +502,7 @@ PORTAL_HTML = """
   <div id="sessionbar" class="muted" style="margin:.4rem 0"></div>
 
   <!-- SUBIR PDFs -->
-  <form id="up" method="post" enctype="multipart/form-data" class="no-print">
+  <form id="up" method="post" action="/upload" enctype="multipart/form-data" class="no-print">
     <input id="fileInput" type="file" name="files" multiple accept="application/pdf">
     <small class="muted">Límites: máx <b>[MAX_FILES]</b> PDFs por subida · <b>[SINGLE_MAX] MB</b> cada uno · hasta <b>[TOTAL_MAX] MB</b> en total.</small>
     <div class="bar" style="margin-top:8px">
@@ -617,18 +617,17 @@ fi?.addEventListener('change', async () => {
   fi.value = ""; // limpia selección para que puedas elegir otro(s)
 });
 
-up.onsubmit = async e => {
+document.getElementById('up')?.addEventListener('submit', async (e) => {
   e.preventDefault();
   const input = document.getElementById('fileInput');
   const files = Array.from(input.files || []);
   const box = document.getElementById('upres');
   if (!files.length) { box.textContent = "Selecciona al menos un PDF."; return; }
 
-  // Validaciones básicas UX
   let total = 0;
   for (const f of files) {
     total += f.size;
-    if (!/\\.pdf$/i.test(f.name)) { box.textContent = `${f.name}: solo PDF`; return; }
+    if (!/\.pdf$/i.test(f.name)) { box.textContent = `${f.name}: solo PDF`; return; }
     if (f.size > SINGLE_MAX*1024*1024) { box.textContent = `${f.name} supera ${SINGLE_MAX} MB (${toMB(f.size)})`; return; }
   }
   if (total > TOTAL_MAX*1024*1024) {
@@ -636,23 +635,21 @@ up.onsubmit = async e => {
     return;
   }
 
-  const fd = new FormData(up);
+  const fd = new FormData(document.getElementById('up'));
   const r  = await withToken('/upload',{method:'POST',body:fd});
   const data = await r.json();
-  if(!data.ok){
-    box.textContent = (data.message || 'Error subiendo archivos.');
-    return;
-  }
+  if(!data.ok){ box.textContent = (data.message || 'Error subiendo archivos.'); return; }
   const names = (data.saved||[]).join(", ");
   box.textContent = `En este instante cargando tus archivo(s) PDF: ${names}. Los estamos procesando en segundo plano para analizarlos.`;
   input.value = "";
-};
+});
+
 
 // ---------------- PREGUNTAR ----------------
-askf.onsubmit = async (e) => {
+document.getElementById('askf')?.addEventListener('submit', async (e) => {
   e.preventDefault();
-  const raw = new FormData(askf).get('questions') || '';
-  const list = raw.split(/\\r?\\n/).map(s => s.trim()).filter(Boolean).slice(0, 5);
+  const raw = new FormData(document.getElementById('askf')).get('questions') || '';
+  const list = raw.split(/\r?\n/).map(s => s.trim()).filter(Boolean).slice(0, 5);
   const prosa = document.getElementById('prosa')?.checked || false;
 
   const box = document.getElementById('askres');
@@ -682,13 +679,14 @@ askf.onsubmit = async (e) => {
   } catch (err) {
     box.textContent = 'ERROR de red: ' + err;
   }
-};
+});
+
 
 // ---------------- REPORTE ----------------
 
-rep.onsubmit = async e => {
+document.getElementById('rep')?.addEventListener('submit', async (e) => {
   e.preventDefault();
-  const periodo = new FormData(rep).get('periodo') || '';
+  const periodo = new FormData(document.getElementById('rep')).get('periodo') || '';
   const repBox = document.getElementById('repres');
   const chartsBox = document.getElementById('repcharts');
   repBox.textContent = 'Generando…';
@@ -701,6 +699,7 @@ rep.onsubmit = async e => {
   });
   const data = await r.json();
   renderMD(repBox, data.report_markdown || JSON.stringify(data,null,2));
+
 
   // --- Datos base para todos los gráficos ---
   const k = data.kpis || {};
