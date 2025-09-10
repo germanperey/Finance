@@ -684,7 +684,6 @@ async function doUpload(){
 }
 
 // Botón y Enter del formulario
-btnU?.addEventListener('click', doUpload);
 document.getElementById('up')?.addEventListener('submit', (e) => { e.preventDefault(); doUpload(); });
 
 
@@ -1105,10 +1104,10 @@ async def upload(
         if len(content) > single_max:
             return {"ok": False, "message": f"{name}: supera {settings.SINGLE_FILE_MAX_MB} MB"}
         try:
-    			with open(base/"docs"/name, "wb") as out:
-        		out.write(content)
-	except Exception as e:
-    			raise HTTPException(500, f"No pude guardar {name}: {e}")
+    with open(base/"docs"/name, "wb") as out:
+        out.write(content)
+except Exception as e:
+    raise HTTPException(500, f"No pude guardar {name}: {e}")
 
         saved_names.append(name)
 
