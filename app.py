@@ -1095,29 +1095,39 @@ async def upload(
 
     total_size = 0
     saved_names: List[str] = []
+
     for f in files:
-        name = (f.filename or "archivo.pdf").strip()
+        # Nombre seguro (evita rutas tipo ../../algo.pdf)
+        name = os.path.basename((f.filename or "archivo.pdf").strip())
         if not name.lower().endswith(".pdf"):
             return {"ok": False, "message": f"{name}: solo se aceptan PDF"}
-        content = await f.read()                     # SOLO guardamos; nada pesado aquí
+
+        # Leemos el archivo (en memoria). Si prefieres stream, se puede ajustar.
+        content = await f.read()
         total_size += len(content)
+
         if len(content) > single_max:
             return {"ok": False, "message": f"{name}: supera {settings.SINGLE_FILE_MAX_MB} MB"}
+
         try:
-    with open(base/"docs"/name, "wb") as out:
-        out.write(content)
-except Exception as e:
-    raise HTTPException(500, f"No pude guardar {name}: {e}")
+            # ←← **AQUÍ estaba la indentación mal**
+            with open(base/"docs"/name, "wb") as out:
+                out.write(content)
+        except Exception as e:
+            raise HTTPException(500, f"No pude guardar {name}: {e}")
 
         saved_names.append(name)
 
+    # Límite total por subida: si se excede, deshacemos lo guardado
     if total_size > total_max:
         for nm in saved_names:
-            try: (base/"docs"/nm).unlink(missing_ok=True)
-            except: pass
+            try:
+                (base/"docs"/nm).unlink(missing_ok=True)
+            except:
+                pass
         return {"ok": False, "message": f"Superaste el total permitido ({settings.MAX_TOTAL_MB} MB por subida)."}
 
-    # 👉 La indexación pesada se hace en segundo plano (evita el 502/504)
+    # Indexación pesada en segundo plano (evita timeouts)
     background_tasks.add_task(index_worker, str(base), saved_names)
 
     return {
