@@ -115,6 +115,7 @@ mp = mercadopago.SDK(settings.MP_ACCESS_TOKEN) if settings else None
 COUPONS = {
     "INVESTU-100": {"type": "free", "desc": "Acceso gratis"},  # ← cambia aquí
     "INVESTU-50":  {"type": "percent", "value": 50, "desc": "50% OFF"},
+    "PASE-GRATIS": {"type": "free", "desc": "Gratis 1 día"},
 }
 
 # Guardas de configuración para MP
@@ -568,11 +569,11 @@ function toMB(n){ return (n/1024/1024).toFixed(1) + " MB"; }
 
 async function withToken(url, opts = {}) {
   const t = localStorage.getItem('token') || '';
-  // Asegura que las cookies del dominio SIEMPRE viajen
   opts.credentials = 'include';
-  if (t) {
-    opts.headers = { ...(opts.headers || {}), Authorization: 'Bearer ' + t };
-  }
+  // 👉 Siempre pedimos JSON para que el backend no intente devolver HTML
+  const baseHeaders = { Accept: 'application/json' };
+  if (t) baseHeaders.Authorization = 'Bearer ' + t;
+  opts.headers = { ...baseHeaders, ...(opts.headers || {}) };
   return fetch(url, opts);
 }
 
@@ -678,6 +679,18 @@ async function doUpload(){
       ? `Cargados: ${names}. Se están procesando en segundo plano.`
       : 'Subida completa. Se están procesando en segundo plano.';
     fi.value = ''; // limpiar selección
+
+    // ✅ NUEVO: consultar el estado del índice y mostrarlo
+    try {
+      const s = await withToken('/status');
+      if (s.ok) {
+        const st = await s.json();
+        upBox.textContent += `\nÍndice: ${st.fragments} fragmentos · ${st.docs} documento(s).`;
+      }
+    } catch (e) {
+      // si falla, lo ignoramos silenciosamente
+    }
+
   }catch(err){
     upBox.textContent = 'Error de red o sesión: ' + err;
   }
@@ -947,7 +960,7 @@ async def home():
 
 @app.post("/mp/create-preference")
 async def mp_create_preference(payload: Dict[str, str]):
-    _require_mp()  # ← añade esta línea
+    _require_mp()
     nombre   = payload.get("nombre", "").strip()
     apellido = payload.get("apellido", "").strip()
     gmail    = payload.get("gmail", "").strip().lower()
@@ -958,19 +971,23 @@ async def mp_create_preference(payload: Dict[str, str]):
     if not re.match(r"^[^@\s]+@gmail\.com$", gmail):
         raise HTTPException(400, "Debes usar un correo @gmail.com válido")
 
-    # --- Cupón propio ---
-    if coupon == "INVESTU-100":
-        # acceso gratis: generar token y NO pasar por Mercado Pago
+    # --- Cupón (usa la tabla COUPONS) ---
+    price = float(settings.MP_PRICE_1DAY)         # precio base
+    c = COUPONS.get(coupon) if coupon else None   # busca el cupón en la tabla
+
+    # Cupón de acceso GRATIS
+    if c and c.get("type") == "free":
         uid = make_user_id(gmail)
         ensure_dirs(user_dir(uid))
         token = make_token(uid, 24)
         return {"skip": True, "token": token}
 
-    # (opcional) descuento 50%
-    price = float(settings.MP_PRICE_1DAY)
-    if coupon == "INVESTU-50":
-        price = max(1.0, round(price * 0.5))
+    # Cupón de descuento PORCENTAJE (ej. 50%)
+    if c and c.get("type") == "percent":
+        pct = float(c.get("value", 0))
+        price = max(1.0, round(price * (100 - pct) / 100))
 
+    # Crear preferencia de pago en Mercado Pago
     preference = {
         "items": [{
             "title": f"Pase 1 día — {settings.APP_NAME}",
@@ -1118,7 +1135,7 @@ async def upload(
 
         saved_names.append(name)
 
-    # Límite total por subida: si se excede, deshacemos lo guardado
+        # Límite total por subida: si se excede, deshacemos lo guardado
     if total_size > total_max:
         for nm in saved_names:
             try:
@@ -1127,10 +1144,10 @@ async def upload(
                 pass
         return {"ok": False, "message": f"Superaste el total permitido ({settings.MAX_TOTAL_MB} MB por subida)."}
 
-        # Indexación pesada en segundo plano (evita timeouts)
+    # Indexación pesada en segundo plano (evita timeouts)
     background_tasks.add_task(index_worker, str(base), saved_names)
 
-    # Respuesta estándar para llamadas via fetch (JSON)
+    # Respuesta estándar para fetch (JSON)
     resp = {
         "ok": True,
         "saved": saved_names,
@@ -1139,14 +1156,23 @@ async def upload(
         "note": "Estamos procesando tus PDFs en segundo plano."
     }
 
-    # ✔ Parachoques: si el cliente vino por submit tradicional (espera HTML),
-    #   redirigimos al portal para que no se quede viendo el JSON.
+
+    # Respuesta estándar para fetch (JSON)
+    resp = {
+        "ok": True,
+        "saved": saved_names,
+        "errors": [],
+        "indexing": "in_progress",
+        "note": "Estamos procesando tus PDFs en segundo plano."
+    }
+
+    # Parachoques: si la petición vino esperando HTML (submit tradicional),
+    # redirige al portal para que no se quede viendo el JSON.
     accept = (request.headers.get("accept") or "").lower()
     if "text/html" in accept and "application/json" not in accept:
-        # 303 = redirige con GET al destino
         return RedirectResponse(url="/portal", status_code=303)
 
-    # Llamadas via fetch (Accept */*) reciben el JSON normal
+    # Para fetch: devuelve JSON
     return resp
 
 
