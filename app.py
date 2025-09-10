@@ -601,79 +601,79 @@ function renderMD(el, md){
 
 // ---------------- SUBIR PDFs ----------------
 
-const fi  = document.getElementById('fileInput');
-const box = document.getElementById('upres');
+// Elementos
+const up    = document.getElementById('up');
+const fi    = document.getElementById('fileInput');
+const upBox = document.getElementById('upres');
 
-function toMB(n){ return (n/1024/1024).toFixed(1) + " MB"; }
+// ✅ usa la función toMB() que ya está declarada más arriba. No la dupliques aquí.
 
-// 1) VALIDAR SOLO EN change (no sube aquí)
-fi?.addEventListener('change', () => {
-  const files = Array.from(fi.files || []);
-  if (!files.length){ box.textContent = 'No seleccionaste archivos.'; return; }
-
-  if (files.length > MAX_FILES){
-    box.textContent = `Máximo ${MAX_FILES} PDFs por subida.`;
-    fi.value = '';
-    return;
-  }
+// --- Validador común ---
+function validateFiles(files){
+  if (!files.length) return { ok:false, msg:'Selecciona al menos un PDF.' };
+  if (files.length > MAX_FILES) return { ok:false, msg:`Máximo ${MAX_FILES} PDFs por subida.` };
 
   let total = 0;
   for (const f of files){
     total += f.size;
-    if (!/\.pdf$/i.test(f.name)){
-      box.textContent = `${f.name}: solo PDF`;
-      fi.value = '';
-      return;
-    }
-    if (f.size > SINGLE_MAX*1024*1024){
-      box.textContent = `${f.name} supera ${SINGLE_MAX} MB (${toMB(f.size)})`;
-      fi.value = '';
-      return;
-    }
+    if (!/\.pdf$/i.test(f.name)) return { ok:false, msg:`${f.name}: solo PDF` };
+    if (f.size > SINGLE_MAX*1024*1024) return { ok:false, msg:`${f.name} supera ${SINGLE_MAX} MB (${toMB(f.size)})` };
   }
-  if (total > TOTAL_MAX*1024*1024){
-    box.textContent = `Superaste el total permitido (${TOTAL_MAX} MB). Estás subiendo ${toMB(total)}.`;
-    fi.value = '';
-    return;
-  }
+  if (total > TOTAL_MAX*1024*1024)
+    return { ok:false, msg:`Superaste el total permitido (${TOTAL_MAX} MB). Estás subiendo ${toMB(total)}.` };
 
-  // OK: no subimos todavía, solo informamos
-  box.textContent = `Listo: ${files.map(f=>f.name).join(', ')}. Ahora presiona “Subir PDFs e indexar”.`;
+  return { ok:true };
+}
+
+// --- Sólo validación al elegir archivos (no sube aún) ---
+fi?.addEventListener('change', () => {
+  const files = Array.from(fi.files || []);
+  const v = validateFiles(files);
+  if (!v.ok){ upBox.textContent = v.msg; fi.value = ''; return; }
+  upBox.textContent = `Listo: ${files.map(f=>f.name).join(', ')}. Ahora presiona “Subir PDFs e indexar”.`;
 });
 
-// 2) BOTÓN: sube lo que esté seleccionado
-document.getElementById('btnUpload')?.addEventListener('click', async () => {
+// --- Subir lo seleccionado ---
+async function doUpload(){
   const files = Array.from(fi?.files || []);
-  if (!files.length){
-    box.textContent = 'Selecciona al menos un PDF.';
-    fi?.click(); // abre el selector
-    return;
-  }
+  const v = validateFiles(files);
+  if (!v.ok){ upBox.textContent = v.msg; if(!files.length) fi?.click(); return; }
 
+  // Armamos el FormData como espera FastAPI: clave 'files' repetida
   const fd = new FormData();
   files.forEach(f => fd.append('files', f));
 
-  box.textContent = 'Subiendo…';
+  upBox.textContent = 'Subiendo…';
   try{
     const r = await withToken('/upload', { method:'POST', body: fd });
-    const data = await r.json();
-    if (!data.ok){
-      box.textContent = data.message || 'Error subiendo archivos.';
+
+    // Leemos texto primero por si el backend devuelve HTML o texto plano en errores
+    const raw = await r.text();
+    let data;
+    try { data = JSON.parse(raw); } catch { data = null; }
+
+    // Mensajes claros de error
+    if (!r.ok || (data && data.ok === false)){
+      const msg = (data && (data.message || data.detail))
+                  || raw
+                  || `Error HTTP ${r.status}`;
+      upBox.textContent = `Error subiendo archivos: ${msg}`;
       return;
     }
-    const names = (data.saved || []).join(', ');
-    box.textContent = `Cargados: ${names}. Se están procesando en segundo plano.`;
-    fi.value = ''; // limpiamos después de subir
-  }catch(err){
-    box.textContent = 'Error de red o sesión: ' + err;
-  }
-});
 
-// 3) Si el usuario aprieta Enter en el form, hace lo mismo que el botón
-document.getElementById('up')?.addEventListener('submit', (e) => {
-  e.preventDefault();
-  document.getElementById('btnUpload')?.click();
-});
+    const names = (data?.saved || []).join(', ');
+    upBox.textContent = `Cargados: ${names}. Se están procesando en segundo plano.`;
+    fi.value = ''; // limpiar selección
+  }catch(err){
+    upBox.textContent = 'Error de red o sesión: ' + err;
+  }
+}
+
+// Botón principal
+document.getElementById('btnUpload')?.addEventListener('click', doUpload);
+
+// Enter en el formulario hace lo mismo que el botón
+up?.addEventListener('submit', (e) => { e.preventDefault(); doUpload(); });
 
 
 
