@@ -82,7 +82,7 @@ APP_NAME_SAFE = (settings.APP_NAME if settings else "Asesor Financiero")
 app = FastAPI(title=(settings.APP_NAME if settings else "Finance"))
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://finance-4vlf.onrender.com", "https://www.inbestu.com", "https://www.vedetodo.online"],  # o la lista que corresponda
+    allow_origins=["https://finance-4vlf.onrender.com", "https://www.inbestu.com", "https://www.vedetodo.online", "http://localhost:8000"],  # o la lista que corresponda
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -506,7 +506,7 @@ PORTAL_HTML = """
     <input id="fileInput" type="file" name="files" multiple accept="application/pdf">
     <small class="muted">Límites: máx <b>[MAX_FILES]</b> PDFs por subida · <b>[SINGLE_MAX] MB</b> cada uno · hasta <b>[TOTAL_MAX] MB</b> en total.</small>
     <div class="bar" style="margin-top:8px">
-      <button id="btnUpload" type="button">Subir PDFs e indexar</button>
+      <button id="btnUpload" type="submit">Subir PDFs e indexar</button>
       <small class="muted">También puedes seleccionar 1 archivo, subirlo, y repetir para agregar “uno a uno”.</small>
     </div>
   </form>
@@ -597,6 +597,14 @@ function renderMD(el, md){
     });
   } catch(err) { el.textContent = "Error renderizando Markdown: " + err; }
 }
+
+
+// --- Diagnóstico mínimo (muestra errores JS en pantalla) ---
+window.addEventListener('error', (e) => {
+  const box = document.getElementById('upres');
+  if (box) box.textContent = 'Error JS: ' + (e.message || (e.error && e.error.message) || 'desconocido');
+});
+document.getElementById('upres').textContent = 'JS cargó correctamente.';
 
 
 // ---------------- SUBIR PDFs ----------------
@@ -1096,8 +1104,12 @@ async def upload(
         total_size += len(content)
         if len(content) > single_max:
             return {"ok": False, "message": f"{name}: supera {settings.SINGLE_FILE_MAX_MB} MB"}
-        with open(base/"docs"/name, "wb") as out:
-            out.write(content)
+        try:
+    			with open(base/"docs"/name, "wb") as out:
+        		out.write(content)
+	except Exception as e:
+    			raise HTTPException(500, f"No pude guardar {name}: {e}")
+
         saved_names.append(name)
 
     if total_size > total_max:
