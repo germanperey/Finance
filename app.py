@@ -602,7 +602,6 @@ function renderMD(el, md){
 // ---------------- SUBIR PDFs ----------------
 
 // Elementos
-const up    = document.getElementById('up');
 const fi    = document.getElementById('fileInput');
 const upBox = document.getElementById('upres');
 
