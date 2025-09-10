@@ -439,7 +439,7 @@ async function startCheckout(ev){
 <body>
 <div class="card">
   <h1>[APPNAME]</h1>
-  <p class="muted">Acceso por 24h tras el pago con Mercado Pago. Sube tus informes PDF y obtén KPI + análisis + sugerencias. Para soporte técnico: <b>dreamingup7@gmail.com</b>.</p>
+  <p class="muted">Acceso por 24h tras el pago con Mercado Pago. Sube tus informes PDF y obtén KPI + análisis + sugerencias. Para soporte: <b>dreamingup7@gmail.com</b>.</p>
 
   <form onsubmit="startCheckout(event)">
     <div class="row">
@@ -568,12 +568,13 @@ function toMB(n){ return (n/1024/1024).toFixed(1) + " MB"; }
 
 async function withToken(url, opts = {}) {
   const t = localStorage.getItem('token') || '';
+  // Asegura que las cookies del dominio SIEMPRE viajen
+  opts.credentials = 'include';
   if (t) {
     opts.headers = { ...(opts.headers || {}), Authorization: 'Bearer ' + t };
   }
   return fetch(url, opts);
 }
-
 
 
 // ------ Render Markdown + Matemáticas + Gráficos ------
@@ -597,6 +598,7 @@ function renderMD(el, md){
   } catch(err) { el.textContent = "Error renderizando Markdown: " + err; }
 }
 
+
 // ---------------- SUBIR PDFs ----------------
 const fi = document.getElementById('fileInput');
 fi?.addEventListener('change', async () => {
@@ -618,10 +620,27 @@ fi?.addEventListener('change', async () => {
 });
 
 // 👉 NUEVO: al hacer clic en el botón, abrir el selector de archivos
-document.getElementById('btnUpload')?.addEventListener('click', () => {
-  document.getElementById('fileInput')?.click();
-  // (equivalente) si prefieres usar la variable:
-  // fi?.click();
+document.getElementById('btnUpload')?.addEventListener('click', async () => {
+  const files = Array.from(fi?.files || []);
+  if (files.length) {
+    // Reutilizamos el mismo flujo que en el 'change'
+    const box = document.getElementById('upres');
+    const fd = new FormData();
+    files.forEach(f => fd.append('files', f));
+    box.textContent = 'Subiendo…';
+    const r = await withToken('/upload', { method:'POST', body: fd });
+    const data = await r.json();
+    if(!data.ok){
+      box.textContent = (data.message || 'Error subiendo archivos.');
+      return;
+    }
+    const names = (data.saved||[]).join(", ");
+    box.textContent = `En este instante cargando tus archivo(s) PDF: ${names}. Los estamos procesando en segundo plano para analizarlos.`;
+    fi.value = "";
+  } else {
+    // Si no hay archivos elegidos aún, abre el selector
+    fi?.click();
+  }
 });
 
 
