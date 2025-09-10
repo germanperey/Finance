@@ -82,7 +82,7 @@ APP_NAME_SAFE = (settings.APP_NAME if settings else "Asesor Financiero")
 app = FastAPI(title=(settings.APP_NAME if settings else "Finance"))
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://finance-4vlf.onrender.com"],  # o la lista que corresponda
+    allow_origins=["https://finance-4vlf.onrender.com", "https://www.inbestu.com", "https://www.vedetodo.online"],  # o la lista que corresponda
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -439,7 +439,7 @@ async function startCheckout(ev){
 <body>
 <div class="card">
   <h1>[APPNAME]</h1>
-  <p class="muted">Acceso por 24h tras el pago con Mercado Pago. Sube tus informes PDF y obtén KPI + análisis + sugerencias. Para asesoría completa: <b>dreamingup7@gmail.com</b>.</p>
+  <p class="muted">Acceso por 24h tras el pago con Mercado Pago. Sube tus informes PDF y obtén KPI + análisis + sugerencias. Para soporte técnico: <b>dreamingup7@gmail.com</b>.</p>
 
   <form onsubmit="startCheckout(event)">
     <div class="row">
@@ -506,7 +506,7 @@ PORTAL_HTML = """
     <input id="fileInput" type="file" name="files" multiple accept="application/pdf">
     <small class="muted">Límites: máx <b>[MAX_FILES]</b> PDFs por subida · <b>[SINGLE_MAX] MB</b> cada uno · hasta <b>[TOTAL_MAX] MB</b> en total.</small>
     <div class="bar" style="margin-top:8px">
-      <button id="btnUpload">Subir PDFs e indexar</button>
+      <button id="btnUpload" type="button">Subir PDFs e indexar</button>
       <small class="muted">También puedes seleccionar 1 archivo, subirlo, y repetir para agregar “uno a uno”.</small>
     </div>
   </form>
@@ -616,6 +616,14 @@ fi?.addEventListener('change', async () => {
   box.textContent = `En este instante cargando tus archivo(s) PDF: ${names}. Los estamos procesando en segundo plano para analizarlos.`;
   fi.value = ""; // limpia selección para que puedas elegir otro(s)
 });
+
+// 👉 NUEVO: al hacer clic en el botón, abrir el selector de archivos
+document.getElementById('btnUpload')?.addEventListener('click', () => {
+  document.getElementById('fileInput')?.click();
+  // (equivalente) si prefieres usar la variable:
+  // fi?.click();
+});
+
 
 document.getElementById('up')?.addEventListener('submit', async (e) => {
   e.preventDefault();
