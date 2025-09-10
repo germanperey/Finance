@@ -600,76 +600,81 @@ function renderMD(el, md){
 
 
 // ---------------- SUBIR PDFs ----------------
-const fi = document.getElementById('fileInput');
-fi?.addEventListener('change', async () => {
-  // Subida inmediata → permite “uno a uno” o varios a la vez
+
+const fi  = document.getElementById('fileInput');
+const box = document.getElementById('upres');
+
+function toMB(n){ return (n/1024/1024).toFixed(1) + " MB"; }
+
+// 1) VALIDAR SOLO EN change (no sube aquí)
+fi?.addEventListener('change', () => {
   const files = Array.from(fi.files || []);
-  if(!files.length) return;
-  const box = document.getElementById('upres');
-  const fd = new FormData();
-  files.forEach(f => fd.append('files', f));
-  const r = await withToken('/upload',{method:'POST',body:fd});
-  const data = await r.json();
-  if(!data.ok){
-    box.textContent = (data.message || 'Error subiendo archivos.');
+  if (!files.length){ box.textContent = 'No seleccionaste archivos.'; return; }
+
+  if (files.length > MAX_FILES){
+    box.textContent = `Máximo ${MAX_FILES} PDFs por subida.`;
+    fi.value = '';
     return;
   }
-    const names = (data.saved||[]).join(", ");
-  box.textContent = `En este instante cargando tus archivo(s) PDF: ${names}. Los estamos procesando en segundo plano para analizarlos.`;
-  fi.value = ""; // limpia selección para que puedas elegir otro(s)
-});
-
-// 👉 NUEVO: al hacer clic en el botón, abrir el selector de archivos
-document.getElementById('btnUpload')?.addEventListener('click', async () => {
-  const files = Array.from(fi?.files || []);
-  if (files.length) {
-    // Reutilizamos el mismo flujo que en el 'change'
-    const box = document.getElementById('upres');
-    const fd = new FormData();
-    files.forEach(f => fd.append('files', f));
-    box.textContent = 'Subiendo…';
-    const r = await withToken('/upload', { method:'POST', body: fd });
-    const data = await r.json();
-    if(!data.ok){
-      box.textContent = (data.message || 'Error subiendo archivos.');
-      return;
-    }
-    const names = (data.saved||[]).join(", ");
-    box.textContent = `En este instante cargando tus archivo(s) PDF: ${names}. Los estamos procesando en segundo plano para analizarlos.`;
-    fi.value = "";
-  } else {
-    // Si no hay archivos elegidos aún, abre el selector
-    fi?.click();
-  }
-});
-
-
-document.getElementById('up')?.addEventListener('submit', async (e) => {
-  e.preventDefault();
-  const input = document.getElementById('fileInput');
-  const files = Array.from(input.files || []);
-  const box = document.getElementById('upres');
-  if (!files.length) { box.textContent = "Selecciona al menos un PDF."; return; }
 
   let total = 0;
-  for (const f of files) {
+  for (const f of files){
     total += f.size;
-    if (!/\.pdf$/i.test(f.name)) { box.textContent = `${f.name}: solo PDF`; return; }
-    if (f.size > SINGLE_MAX*1024*1024) { box.textContent = `${f.name} supera ${SINGLE_MAX} MB (${toMB(f.size)})`; return; }
+    if (!/\.pdf$/i.test(f.name)){
+      box.textContent = `${f.name}: solo PDF`;
+      fi.value = '';
+      return;
+    }
+    if (f.size > SINGLE_MAX*1024*1024){
+      box.textContent = `${f.name} supera ${SINGLE_MAX} MB (${toMB(f.size)})`;
+      fi.value = '';
+      return;
+    }
   }
-  if (total > TOTAL_MAX*1024*1024) {
+  if (total > TOTAL_MAX*1024*1024){
     box.textContent = `Superaste el total permitido (${TOTAL_MAX} MB). Estás subiendo ${toMB(total)}.`;
+    fi.value = '';
     return;
   }
 
-  const fd = new FormData(document.getElementById('up'));
-  const r  = await withToken('/upload',{method:'POST',body:fd});
-  const data = await r.json();
-  if(!data.ok){ box.textContent = (data.message || 'Error subiendo archivos.'); return; }
-  const names = (data.saved||[]).join(", ");
-  box.textContent = `En este instante cargando tus archivo(s) PDF: ${names}. Los estamos procesando en segundo plano para analizarlos.`;
-  input.value = "";
+  // OK: no subimos todavía, solo informamos
+  box.textContent = `Listo: ${files.map(f=>f.name).join(', ')}. Ahora presiona “Subir PDFs e indexar”.`;
 });
+
+// 2) BOTÓN: sube lo que esté seleccionado
+document.getElementById('btnUpload')?.addEventListener('click', async () => {
+  const files = Array.from(fi?.files || []);
+  if (!files.length){
+    box.textContent = 'Selecciona al menos un PDF.';
+    fi?.click(); // abre el selector
+    return;
+  }
+
+  const fd = new FormData();
+  files.forEach(f => fd.append('files', f));
+
+  box.textContent = 'Subiendo…';
+  try{
+    const r = await withToken('/upload', { method:'POST', body: fd });
+    const data = await r.json();
+    if (!data.ok){
+      box.textContent = data.message || 'Error subiendo archivos.';
+      return;
+    }
+    const names = (data.saved || []).join(', ');
+    box.textContent = `Cargados: ${names}. Se están procesando en segundo plano.`;
+    fi.value = ''; // limpiamos después de subir
+  }catch(err){
+    box.textContent = 'Error de red o sesión: ' + err;
+  }
+});
+
+// 3) Si el usuario aprieta Enter en el form, hace lo mismo que el botón
+document.getElementById('up')?.addEventListener('submit', (e) => {
+  e.preventDefault();
+  document.getElementById('btnUpload')?.click();
+});
+
 
 
 // ---------------- PREGUNTAR ----------------
