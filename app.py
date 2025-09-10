@@ -502,11 +502,11 @@ PORTAL_HTML = """
   <div id="sessionbar" class="muted" style="margin:.4rem 0"></div>
 
   <!-- SUBIR PDFs -->
-  <form id="up" method="post" action="/upload" enctype="multipart/form-data" class="no-print">
+  <form id="up" enctype="multipart/form-data" class="no-print" onsubmit="return false;">
     <input id="fileInput" type="file" name="files" multiple accept="application/pdf">
     <small class="muted">Límites: máx <b>[MAX_FILES]</b> PDFs por subida · <b>[SINGLE_MAX] MB</b> cada uno · hasta <b>[TOTAL_MAX] MB</b> en total.</small>
     <div class="bar" style="margin-top:8px">
-      <button id="btnUpload" type="submit">Subir PDFs e indexar</button>
+      <button id="btnUpload" type="button" onclick="doUpload()">Subir PDFs e indexar</button>
       <small class="muted">También puedes seleccionar 1 archivo, subirlo, y repetir para agregar “uno a uno”.</small>
     </div>
   </form>
