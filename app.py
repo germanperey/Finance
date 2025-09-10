@@ -33,7 +33,7 @@ from typing import Optional
 
 import mercadopago
 from fastapi import FastAPI, Request, UploadFile, File, HTTPException, BackgroundTasks
-from fastapi.responses import HTMLResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic_settings import BaseSettings
 from jose import jwt, JWTError
@@ -1127,16 +1127,28 @@ async def upload(
                 pass
         return {"ok": False, "message": f"Superaste el total permitido ({settings.MAX_TOTAL_MB} MB por subida)."}
 
-    # Indexación pesada en segundo plano (evita timeouts)
+        # Indexación pesada en segundo plano (evita timeouts)
     background_tasks.add_task(index_worker, str(base), saved_names)
 
-    return {
+    # Respuesta estándar para llamadas via fetch (JSON)
+    resp = {
         "ok": True,
         "saved": saved_names,
         "errors": [],
         "indexing": "in_progress",
         "note": "Estamos procesando tus PDFs en segundo plano."
     }
+
+    # ✔ Parachoques: si el cliente vino por submit tradicional (espera HTML),
+    #   redirigimos al portal para que no se quede viendo el JSON.
+    accept = (request.headers.get("accept") or "").lower()
+    if "text/html" in accept and "application/json" not in accept:
+        # 303 = redirige con GET al destino
+        return RedirectResponse(url="/portal", status_code=303)
+
+    # Llamadas via fetch (Accept */*) reciben el JSON normal
+    return resp
+
 
 
 @app.post("/upload-zip")
