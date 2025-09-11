@@ -80,9 +80,25 @@ except Exception as e:
 APP_NAME_SAFE = (settings.APP_NAME if settings else "Asesor Financiero")
 
 app = FastAPI(title=(settings.APP_NAME if settings else "Finance"))
+
+# CORS: admitir apex y www + localhost
+allowed = {
+    "http://localhost:8000", "http://127.0.0.1:8000",
+    "https://inbestu.com", "https://www.inbestu.com",
+    "https://vedetodo.online", "https://www.vedetodo.online",
+}
+# También la BASE_URL exacta por si cambia
+if settings and getattr(settings, "BASE_URL", None):
+    allowed.add(settings.BASE_URL)
+    # variante http/https por si toca
+    if settings.BASE_URL.startswith("https://"):
+        allowed.add(settings.BASE_URL.replace("https://","http://"))
+    if settings.BASE_URL.startswith("http://"):
+        allowed.add(settings.BASE_URL.replace("http://","https://"))
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://finance-4vlf.onrender.com", "https://www.inbestu.com", "https://www.vedetodo.online", "http://localhost:8000"],  # o la lista que corresponda
+    allow_origins=list(allowed),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -187,47 +203,108 @@ def idx_paths(base: Path) -> Dict[str, Path]:
     return {"faiss": base/".rag_index"/"index.faiss", "meta": base/".rag_index"/"metadata.jsonl"}
 
 def load_index(base: Path):
-    import faiss  # import aquí
+    import faiss
     p = idx_paths(base)
     dim = get_model().get_sentence_embedding_dimension()
     if p["faiss"].exists() and p["meta"].exists():
         idx = faiss.read_index(str(p["faiss"]))
-        meta = [json.loads(x) for x in open(p["meta"], "r", encoding="utf-8") if x.strip()]
+        meta = []
+        with open(p["meta"], "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line: 
+                    continue
+                try:
+                    meta.append(json.loads(line))
+                except Exception:
+                    # ignora línea parcial si justo se leyó durante escritura
+                    continue
         return idx, meta
     return faiss.IndexFlatIP(dim), []
 
+
 def save_index(base: Path, idx, meta: List[Dict[str, Any]]):
-    import faiss  # import aquí
+    import faiss, os  # import aquí
     p = idx_paths(base)
     p["faiss"].parent.mkdir(parents=True, exist_ok=True)
-    faiss.write_index(idx, str(p["faiss"]))
-    with open(p["meta"], "w", encoding="utf-8") as f:
+
+    # 1) FAISS atómico
+    tmp_faiss = p["faiss"].with_suffix(p["faiss"].suffix + ".tmp")
+    faiss.write_index(idx, str(tmp_faiss))
+    os.replace(tmp_faiss, p["faiss"])
+
+    # 2) metadata.jsonl atómico
+    tmp_meta = p["meta"].with_suffix(p["meta"].suffix + ".tmp")
+    with open(tmp_meta, "w", encoding="utf-8") as f:
         for m in meta:
             f.write(json.dumps(m, ensure_ascii=False) + "\n")
+    os.replace(tmp_meta, p["meta"])
+
 
 def add_pdfs_to_index(base: Path, pdfs: List[Path]) -> int:
-    import fitz  # PyMuPDF (import aquí)
+    import fitz  # PyMuPDF
     ensure_dirs(base)
     idx, meta = load_index(base)
+
     new_txt, new_meta = [], []
+
     for pdf in pdfs:
-        if not pdf.exists(): 
+        if not pdf.exists():
             continue
-        with fitz.open(pdf) as doc:
-            for page_num, page in enumerate(doc, start=1):
-                text = clean_text(page.get_text("text") or "")
-                if len(text) < 50:
-                    continue
-                for ck in chunk_text(text):
-                    new_txt.append(ck)
-                    new_meta.append({"doc_title": pdf.name, "page": page_num, "text": ck})
+        try:
+            with fitz.open(pdf) as doc:
+                for page_num, page in enumerate(doc, start=1):
+                    # 1) Texto "normal"
+                    text = clean_text(page.get_text("text") or "")
+
+                    # 2) Fallback por bloques (capta tablas/cabeceras en varios PDFs)
+                    if len(text) < 50:
+                        try:
+                            blocks = page.get_text("blocks") or []
+                            blk_txt = " ".join(
+                                b[4] for b in blocks
+                                if isinstance(b, (list, tuple)) and len(b) > 4 and isinstance(b[4], str)
+                            )
+                            text = clean_text(blk_txt or text)
+                        except Exception:
+                            pass
+
+                    # 3) Fallback pdfplumber (último recurso)
+                    if len(text) < 50:
+                        try:
+                            import pdfplumber
+                            with pdfplumber.open(str(pdf)) as pp:
+                                pn = page_num - 1
+                                if 0 <= pn < len(pp.pages):
+                                    text2 = pp.pages[pn].extract_text() or ""
+                                    text = clean_text(text2) or text
+                        except Exception:
+                            pass
+
+                    if len(text) < 50:
+                        # página sin texto útil (escaneada o imagen)
+                        continue
+
+                    for ck in chunk_text(text):
+                        new_txt.append(ck)
+                        new_meta.append({
+                            "doc_title": pdf.name,
+                            "page": page_num,
+                            "text": ck
+                        })
+        except Exception as e:
+            print(f"[add_pdfs_to_index] ERROR abriendo {pdf}: {e}", flush=True)
+            continue
+
     if not new_txt:
         return 0
+
     vecs = embed_texts(new_txt)
     idx.add(vecs)
     meta.extend(new_meta)
     save_index(base, idx, meta)
     return len(new_txt)
+
 
 def semantic_search(base: Path, q: str, k: int) -> List[Tuple[float, Dict[str, Any]]]:
     idx, meta = load_index(base)
@@ -428,7 +505,8 @@ async function startCheckout(ev){
 
   if (data.skip === true && data.token){
   localStorage.setItem('token', data.token);
-  document.cookie = 'token=' + data.token + '; Path=/; Max-Age=86400; SameSite=Lax; Secure';
+  const secure = (location.protocol === 'https:') ? '; Secure' : '';
+  document.cookie = 'token=' + data.token + '; Path=/; Max-Age=86400; SameSite=Lax' + secure;
   location.href = '/portal';
   return;
 }
@@ -622,9 +700,6 @@ const LIMITS = {
   total: Number(typeof TOTAL_MAX  !== 'undefined' ? TOTAL_MAX  : 100), // MB
 };
 
-// Helper (ya tienes otra, pero por si acaso)
-function toMB(n){ return (n/1024/1024).toFixed(1) + ' MB'; }
-
 // Validador común
 function validateFiles(files){
   if (!files.length)         return { ok:false, msg:'Selecciona al menos un PDF.' };
@@ -730,7 +805,7 @@ document.getElementById('askf')?.addEventListener('submit', async (e) => {
           `</div>`;
       }
     });
-    box.innerHTML = html || "<div class='muted'>Sin resultados.</div>";
+    box.innerHTML = DOMPurify.sanitize(html || "<div class='muted'>Sin resultados.</div>");
     (data.results || []).forEach((it, idx) => renderMD(document.getElementById('ans_'+idx), it.answer_markdown || ""));
   } catch (err) {
     box.textContent = 'ERROR de red: ' + err;
@@ -960,7 +1035,6 @@ async def home():
 
 @app.post("/mp/create-preference")
 async def mp_create_preference(payload: Dict[str, str]):
-    _require_mp()
     nombre   = payload.get("nombre", "").strip()
     apellido = payload.get("apellido", "").strip()
     gmail    = payload.get("gmail", "").strip().lower()
@@ -975,19 +1049,25 @@ async def mp_create_preference(payload: Dict[str, str]):
     price = float(settings.MP_PRICE_1DAY)         # precio base
     c = COUPONS.get(coupon) if coupon else None   # busca el cupón en la tabla
 
-    # Cupón de acceso GRATIS
+    # 1) Acceso GRATIS: no requiere MP
     if c and c.get("type") == "free":
         uid = make_user_id(gmail)
         ensure_dirs(user_dir(uid))
         token = make_token(uid, 24)
         return {"skip": True, "token": token}
 
-    # Cupón de descuento PORCENTAJE (ej. 50%)
-    if c and c.get("type") == "percent":
-        pct = float(c.get("value", 0))
-        price = max(1.0, round(price * (100 - pct) / 100))
+    # 2) Para el resto, ahora sí exigimos MP configurado
+    _require_mp()
 
-    # Crear preferencia de pago en Mercado Pago
+    # 3) Descuento porcentual (si aplica) con decimales según moneda
+decimals = _currency_decimals(settings.MP_CURRENCY)
+if c and c.get("type") == "percent":
+    pct = float(c.get("value", 0))
+    price = max(1.0, round(price * (100 - pct) / 100, decimals))
+# Asegura tipo float/decimal apropiado
+price = float(price)
+
+    # 4) Preferencia MP
     preference = {
         "items": [{
             "title": f"Pase 1 día — {settings.APP_NAME}",
@@ -1012,6 +1092,10 @@ async def mp_create_preference(payload: Dict[str, str]):
                 "init_point": pref.get("init_point") or pref.get("sandbox_init_point")}
     except Exception as e:
         raise HTTPException(500, f"Mercado Pago error: {e}")
+
+def _currency_decimals(code: str) -> int:
+    # CLP/JPY sin decimales; resto 2 por defecto
+    return 0 if str(code).upper() in {"CLP","JPY","KRW"} else 2
 
 
 @app.get("/mp/return", response_class=HTMLResponse)
@@ -1042,10 +1126,12 @@ async def mp_return(status: str | None = None, payment_id: str | None = None, co
     uid = make_user_id(gmail)
     ensure_dirs(user_dir(uid))
     token = make_token(uid, 24)
+
+    secure = "; Secure" if str(settings.BASE_URL).startswith("https://") else ""
     html = f"""
     <script>
       localStorage.setItem('token', '{token}');
-      document.cookie = 'token={token}; Path=/; Max-Age=86400; SameSite=Lax; Secure';
+      document.cookie = 'token={token}; Path=/; Max-Age=86400; SameSite=Lax{secure}';
       location.href='/portal';
     </script>
     """
@@ -1078,7 +1164,6 @@ async def portal(request: Request):
 #     return {"received": True}
 
 # ===================== Rutas protegidas =====================
-
 
 def index_worker(base_dir: str, filenames: list[str]):
     """Se ejecuta en segundo plano: abre y agrega PDFs al índice."""
@@ -1157,15 +1242,6 @@ async def upload(
     }
 
 
-    # Respuesta estándar para fetch (JSON)
-    resp = {
-        "ok": True,
-        "saved": saved_names,
-        "errors": [],
-        "indexing": "in_progress",
-        "note": "Estamos procesando tus PDFs en segundo plano."
-    }
-
     # Parachoques: si la petición vino esperando HTML (submit tradicional),
     # redirige al portal para que no se quede viendo el JSON.
     accept = (request.headers.get("accept") or "").lower()
@@ -1174,7 +1250,6 @@ async def upload(
 
     # Para fetch: devuelve JSON
     return resp
-
 
 
 @app.post("/upload-zip")
@@ -1186,19 +1261,26 @@ async def upload_zip(request: Request, background_tasks: BackgroundTasks, file: 
         raise HTTPException(400, "Sube un .zip con PDFs")
 
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
-    tmp.write(await file.read()); tmp.close()
+    try:
+        tmp.write(await file.read()); tmp.close()
 
-    extracted = []
-    with ZipFile(tmp.name, 'r') as z:
-        for nm in z.namelist():
-            if nm.lower().endswith(".pdf"):
-                dest = base/"docs"/Path(nm).name
-                with z.open(nm) as src, open(dest, "wb") as out:
-                    shutil.copyfileobj(src, out)
-                extracted.append(dest.name)
+        extracted = []
+        with ZipFile(tmp.name, 'r') as z:
+            for nm in z.namelist():
+                if nm.lower().endswith(".pdf"):
+                    dest = base/"docs"/Path(nm).name  # evita ZipSlip
+                    with z.open(nm) as src, open(dest, "wb") as out:
+                        shutil.copyfileobj(src, out)
+                    extracted.append(dest.name)
 
-    background_tasks.add_task(index_worker, str(base), extracted)
-    return {"ok": True, "saved": extracted, "indexing": "in_progress"}
+        background_tasks.add_task(index_worker, str(base), extracted)
+        return {"ok": True, "saved": extracted, "indexing": "in_progress"}
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except Exception:
+            pass
+
 
 @app.post("/ingest/url")
 async def ingest_from_urls(request: Request, background_tasks: BackgroundTasks, body: Dict[str, Any]):
@@ -1207,19 +1289,45 @@ async def ingest_from_urls(request: Request, background_tasks: BackgroundTasks, 
     urls = body.get("urls") or []
     if not isinstance(urls, list) or not urls:
         raise HTTPException(400, "Incluye 'urls': [ ... ] con enlaces a PDFs")
+
+    max_mb = settings.SINGLE_FILE_MAX_MB
+    max_bytes = max_mb * 1024 * 1024
     saved = []
-    async with aiohttp.ClientSession() as ses:
+
+    timeout = aiohttp.ClientTimeout(total=30)
+    async with aiohttp.ClientSession(timeout=timeout) as ses:
         for u in urls:
-            if not str(u).lower().endswith(".pdf"):
+            u = str(u).strip()
+            if not u.lower().startswith(("http://", "https://")):
                 continue
-            fn = base/"docs"/Path(u).name
-            async with ses.get(u) as r:
-                if r.status == 200:
+            fn = (base/"docs"/(Path(u).name or "archivo.pdf")).with_suffix(".pdf")
+            try:
+                async with ses.get(u, allow_redirects=True) as r:
+                    if r.status != 200:
+                        continue
+                    ctype = r.headers.get("Content-Type","").lower()
+                    if "pdf" not in ctype:
+                        continue
+                    # corta por Content-Length si existe
+                    cl = r.headers.get("Content-Length")
+                    if cl and int(cl) > max_bytes:
+                        continue
+                    # stream con tope
+                    read = 0
                     with open(fn, "wb") as out:
-                        out.write(await r.read())
+                        async for chunk in r.content.iter_chunked(64*1024):
+                            read += len(chunk)
+                            if read > max_bytes:
+                                raise HTTPException(413, f"Archivo supera {max_mb} MB")
+                            out.write(chunk)
                     saved.append(fn.name)
-    background_tasks.add_task(index_worker, str(base), saved)
-    return {"ok": True, "saved": saved, "indexing": "in_progress"}
+            except Exception:
+                # ignora URL con error; si prefieres, acumula en 'errors'
+                continue
+
+    if saved:
+        background_tasks.add_task(index_worker, str(base), saved)
+    return {"ok": True, "saved": saved, "indexing": "in_progress" if saved else "none"}
 
 
 @app.get("/status")
