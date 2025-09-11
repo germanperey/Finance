@@ -1,60 +1,83 @@
 #!/usr/bin/env python3
 """
-Agente Financiero en la Nube – versión Mercado Pago (Checkout Pro)
+Asesor Financiero – Portal Seguro y Reporte Interactivo
 
-✔ Pago con Mercado Pago (pase de 1 día)
-✔ Captura de Nombre, Apellido y Gmail (valida que sea @gmail.com)
-✔ Verificación de pago al regresar de Checkout (Payments API)
-✔ Subida de PDFs, RAG por usuario y Reporte KPI (igual que antes)
+Esta aplicación expone una interfaz web y un backend para que los
+usuarios suban sus archivos PDF de análisis económico–financiero, los
+indexen de forma incremental y hagan consultas mediante preguntas en
+lenguaje natural. También genera un reporte automático con gráficos
+e indicadores clave de desempeño (KPI) bilingües, e incluye un
+glosario para abreviaturas financieras. La ruta del portal está
+protegida para que solo accedan usuarios autenticados mediante un
+token JWT recibido tras el pago o cupón. Las cargas de PDFs no
+eliminan los archivos previamente subidos y se procesan en segundo
+plano para evitar tiempos de espera largos.
 
-Cómo usar:
-1) Reemplaza tu app.py por este archivo (o guárdalo como app.py).
-2) En requirements.txt agrega: mercadopago
-3) Variables de entorno nuevas (Render → Environment):
-   MP_ACCESS_TOKEN=APP_USR-xxxxxxxxxxxxxxxxxxxxxxx   # token privado
-   MP_PUBLIC_KEY=TEST-xxxxxxxxxxxxxxxxxxxxxxxxxxxxx  # clave pública (por si luego usas Bricks)
-   MP_PRICE_1DAY=10000                               # precio numérico (ej. CLP)
-   MP_CURRENCY=CLP                                   # moneda (CLP, USD, etc.)
-   BASE_URL=https://TU-URL.onrender.com              # tu URL pública
-   APP_NAME=Asesor Financiero 1‑día
-   JWT_SECRET=un_super_secreto
+Principales características:
 
-Notas:
-- Creamos una Preferencia de pago (Checkout Pro) y redirigimos a su init_point.
-- Configuramos back_urls + auto_return=approved y verificamos el pago con Payments API
-  usando payment_id. (Ver docs oficiales de Preferencias y back_urls).
+* Autenticación con JWT (bearer o cookie) y protección del portal
+  (/portal) ante accesos no autorizados.
+* Carga de archivos PDF de a uno o varios; las subidas sucesivas
+  agregan documentos al índice sin borrar los existentes.
+* Mensajes de retroalimentación amigables: tras subir se indica
+  claramente qué archivos se están procesando.
+* Motor de RAG (retrieval‑augmented generation) por usuario con
+  extracción de fragmentos y metadatos, incluyendo detección de
+  años en el texto para poder filtrar respuestas por periodo.
+* Endpoint /ask para contestar hasta cinco preguntas de manera
+  independiente, filtrando por años cuando se solicitan intervalos
+  (p. ej. “2020–2023”) y evitando respuestas genéricas si no se
+  encuentra evidencia suficiente.
+* Endpoint /auto-report que devuelve datos tabulares y definiciones
+  para construir múltiples gráficos (barras, líneas y pie) y
+  tarjetas KPI con semáforo, fórmulas y acciones sugeridas.
+* Glosario de abreviaturas comúnmente usadas en finanzas.
+
+Al integrar este archivo en tu proyecto y actualizar el frontend
+embebido, tendrás un portal más robusto, seguro y amigable para los
+usuarios finales.
 """
+
 from __future__ import annotations
-import os, re, json, hashlib, shutil
+
+import hashlib
+import json
+import os
+import re
+import shutil
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import List, Dict, Any, Tuple
-from typing import Optional
+from threading import Thread
+from typing import Any, Dict, List, Optional, Tuple
 
 import mercadopago
-from fastapi import FastAPI, Request, UploadFile, File, HTTPException, BackgroundTasks
-from fastapi.responses import HTMLResponse, PlainTextResponse
+from fastapi import (BackgroundTasks, Depends, FastAPI, File, HTTPException,
+                     Request, UploadFile)
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from jose import JWTError, jwt
 from pydantic_settings import BaseSettings
-from jose import jwt, JWTError
-from zipfile import ZipFile
-import tempfile
-import aiohttp
 
-# ===================== Config =====================
+# ===================== Configuración =====================
+
 class Settings(BaseSettings):
+    """Parámetros de configuración cargados desde variables de entorno."""
+    # Mercado Pago / cobranzas
     MP_ACCESS_TOKEN: str
     MP_PUBLIC_KEY: str
     MP_PRICE_1DAY: float
     MP_CURRENCY: str = "CLP"
 
+    # Claves y parámetros generales
     JWT_SECRET: str
     BASE_URL: str = "http://localhost:8000"
-    APP_NAME: str = "Asesor Financiero 1‑día"
+    APP_NAME: str = "Asesor Financiero"
 
+    # OpenAI (opcional, no usado en local)
     OPENAI_API_KEY: str | None = None
     OPENAI_MODEL: str = "gpt-4o-mini"
 
+    # Almacenamiento e índice
     STORAGE_DIR: str = "storage"
     MODEL_NAME: str = "intfloat/multilingual-e5-small"
     CHUNK_SIZE: int = 900
@@ -69,7 +92,9 @@ class Settings(BaseSettings):
     class Config:
         env_file = ".env"
 
-# Cargar settings con manejo de error para que /health lo muestre si falla
+
+# Intenta cargar configuración al inicio; en caso de error se guarda
+# para devolver en /health si es necesario.
 SETTINGS_ERROR = None
 try:
     settings = Settings()
@@ -80,68 +105,110 @@ except Exception as e:
 APP_NAME_SAFE = (settings.APP_NAME if settings else "Asesor Financiero")
 
 app = FastAPI(title=(settings.APP_NAME if settings else "Finance"))
+
+# Permitir orígenes cruzados; incluir base_url y variantes http/https
+allowed = {
+    "http://localhost:8000",
+    "http://127.0.0.1:8000",
+    # Si tu portal está en un dominio propio agrégalo aquí
+}
+if settings and getattr(settings, "BASE_URL", None):
+    allowed.add(settings.BASE_URL)
+    if settings.BASE_URL.startswith("https://"):
+        allowed.add(settings.BASE_URL.replace("https://", "http://"))
+    if settings.BASE_URL.startswith("http://"):
+        allowed.add(settings.BASE_URL.replace("http://", "https://"))
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], allow_credentials=True,
-    allow_methods=["*"], allow_headers=["*"],
+    allow_origins=list(allowed),
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-# ---- Warm-up: precargar el modelo en segundo plano al iniciar ----
-from threading import Thread
+# ================ Utilidades de autenticación =================
 
-@app.on_event("startup")
-def _warm_start():
-    def _preload():
-        try:
-            print(">> Precargando modelo de embeddings...")
-            get_model()  # descarga/carga el modelo una vez
-            print(">> Modelo listo.")
-        except Exception as e:
-            print("!! Error precargando modelo:", e)
-    Thread(target=_preload, daemon=True).start()
-
-# Endpoint manual por si quieres forzarlo desde el navegador: /__warmup
-@app.get("/__warmup")
-def __warmup():
-    get_model()
-    return {"ok": True, "msg": "modelo listo"}
+def make_token(uid: str, hours: int = 24) -> str:
+    """Genera un JWT para el usuario con expiración en horas."""
+    exp = datetime.now(timezone.utc) + timedelta(hours=hours)
+    payload = {"uid": uid, "exp": exp.timestamp()}
+    return jwt.encode(payload, settings.JWT_SECRET, algorithm="HS256")
 
 
-# Mercado Pago SDK
-mp = mercadopago.SDK(settings.MP_ACCESS_TOKEN) if settings else None
-# --- Cupones propios del comercio ---
-COUPONS = {
-    "INVESTU-100": {"type": "free", "desc": "Acceso gratis"},
-    "INVESTU-50":  {"type": "percent", "value": 50, "desc": "50% OFF"},
-}
+def read_token(token: str) -> str:
+    """Valida y decodifica un token JWT, devolviendo el UID."""
+    try:
+        data = jwt.decode(token, settings.JWT_SECRET, algorithms=["HS256"])
+        uid = data.get("uid")
+        if not uid:
+            raise ValueError("Token sin uid")
+        exp_ts = data.get("exp")
+        if exp_ts and datetime.now(timezone.utc).timestamp() > exp_ts:
+            raise ValueError("Token expirado")
+        return uid
+    except JWTError:
+        raise HTTPException(401, "Token inválido")
 
 
-# ===================== Embeddings & RAG (igual) =====================
+def require_user(request: Request) -> str:
+    """Extrae y valida el token del encabezado Authorization o de una cookie."""
+    # Primero intenta Authorization: Bearer <token>
+    auth = request.headers.get("Authorization", "")
+    token: Optional[str] = None
+    if auth.lower().startswith("bearer "):
+        token = auth.split(" ", 1)[1].strip()
+    # Si no hay header, intenta cookie
+    if not token:
+        token = request.cookies.get("token")
+    if not token:
+        raise HTTPException(401, "No autenticado")
+    return read_token(token)
+
+
+# ================ Embeddings y RAG =================
+
 _model = None
+
+
 def get_model():
+    """Carga el modelo de embeddings de forma perezosa."""
     global _model
     if _model is None:
-        from sentence_transformers import SentenceTransformer  # import aquí
+        from sentence_transformers import SentenceTransformer
         _model = SentenceTransformer(settings.MODEL_NAME)
     return _model
 
+
 def embed_texts(texts: List[str]):
-    import numpy as np  # import aquí
-    vecs = get_model().encode(texts, batch_size=32, convert_to_numpy=True,
-                              normalize_embeddings=settings.NORMALIZE)
+    """Genera embeddings para una lista de textos y los devuelve como array float32."""
+    import numpy as np
+    vecs = get_model().encode(
+        texts,
+        batch_size=32,
+        convert_to_numpy=True,
+        normalize_embeddings=settings.NORMALIZE,
+    )
     return np.ascontiguousarray(vecs.astype("float32"))
 
+
 def clean_text(t: str) -> str:
+    """Normaliza el texto eliminando caracteres nulos y espacios extra."""
     t = t.replace("\x00", " ")
     t = "\n".join([ln.strip() for ln in t.splitlines()])
     t = " ".join(t.split())
     return t.strip()
 
+
 def chunk_text(text: str) -> List[str]:
+    """Divide un texto largo en fragmentos superpuestos aptos para embeddings."""
     text = text.strip()
-    if not text: return []
+    if not text:
+        return []
     size, overlap = settings.CHUNK_SIZE, settings.CHUNK_OVERLAP
-    chunks, start, N = [], 0, len(text)
+    chunks: List[str] = []
+    start = 0
+    N = len(text)
     while start < N:
         end = min(start + size, N)
         chunk = text[start:end]
@@ -153,38 +220,53 @@ def chunk_text(text: str) -> List[str]:
         if len(chunk) >= settings.MIN_CHARS:
             chunks.append(chunk)
         start = max(end - overlap, end)
-        if start == end: break
+        if start == end:
+            break
     return chunks
 
-# ===== Paths por usuario =====
 
 def make_user_id(gmail: str) -> str:
+    """Genera un identificador determinista basado en el Gmail."""
     return hashlib.sha256(gmail.lower().encode()).hexdigest()[:16]
 
+
 def user_dir(uid: str) -> Path:
+    """Directorio base de un usuario para docs e índices."""
     return Path(settings.STORAGE_DIR) / uid
 
-def ensure_dirs(base: Path):
-    (base/"docs").mkdir(parents=True, exist_ok=True)
-    (base/".rag_index").mkdir(parents=True, exist_ok=True)
 
-# ===== FAISS por usuario =====
+def ensure_dirs(base: Path):
+    """Crea directorios de almacenamiento e índice si no existen."""
+    (base / "docs").mkdir(parents=True, exist_ok=True)
+    (base / ".rag_index").mkdir(parents=True, exist_ok=True)
+
+
+# ====== Persistencia e índice FAISS por usuario ======
 
 def idx_paths(base: Path) -> Dict[str, Path]:
-    return {"faiss": base/".rag_index"/"index.faiss", "meta": base/".rag_index"/"metadata.jsonl"}
+    return {
+        "faiss": base / ".rag_index" / "index.faiss",
+        "meta": base / ".rag_index" / "metadata.jsonl",
+    }
+
 
 def load_index(base: Path):
-    import faiss  # import aquí
+    """Carga el índice FAISS y la metadata; si no existe, crea uno vacío."""
+    import faiss
     p = idx_paths(base)
     dim = get_model().get_sentence_embedding_dimension()
     if p["faiss"].exists() and p["meta"].exists():
         idx = faiss.read_index(str(p["faiss"]))
         meta = [json.loads(x) for x in open(p["meta"], "r", encoding="utf-8") if x.strip()]
         return idx, meta
-    return faiss.IndexFlatIP(dim), []
+    # índice plano de producto interno (cosine si normalizas)
+    idx = faiss.IndexFlatIP(dim)
+    return idx, []
+
 
 def save_index(base: Path, idx, meta: List[Dict[str, Any]]):
-    import faiss  # import aquí
+    """Persistencia del índice FAISS y metadata."""
+    import faiss
     p = idx_paths(base)
     p["faiss"].parent.mkdir(parents=True, exist_ok=True)
     faiss.write_index(idx, str(p["faiss"]))
@@ -192,584 +274,474 @@ def save_index(base: Path, idx, meta: List[Dict[str, Any]]):
         for m in meta:
             f.write(json.dumps(m, ensure_ascii=False) + "\n")
 
+
+def guess_year_from_text(text: str) -> Optional[int]:
+    """Intenta extraer el primer año de cuatro dígitos del texto (1900–2099)."""
+    for match in re.findall(r"\b(19|20)\d{2}\b", text):
+        try:
+            year = int(match)
+            if 1900 <= year <= 2099:
+                return year
+        except Exception:
+            pass
+    return None
+
+
 def add_pdfs_to_index(base: Path, pdfs: List[Path]) -> int:
-    import fitz  # PyMuPDF (import aquí)
+    """Abre una lista de PDFs, divide en fragmentos, calcula embeddings y
+    añade al índice existente, guardando metadata con doc y año."""
+    import fitz  # PyMuPDF
     ensure_dirs(base)
     idx, meta = load_index(base)
-    new_txt, new_meta = [], []
+    new_txts: List[str] = []
+    new_meta: List[Dict[str, Any]] = []
     for pdf in pdfs:
-        if not pdf.exists(): 
+        try:
+            doc = fitz.open(pdf)
+        except Exception:
             continue
-        with fitz.open(pdf) as doc:
-            for page_num, page in enumerate(doc, start=1):
-                text = clean_text(page.get_text("text") or "")
-                if len(text) < 50:
-                    continue
-                for ck in chunk_text(text):
-                    new_txt.append(ck)
-                    new_meta.append({"doc_title": pdf.name, "page": page_num, "text": ck})
-    if not new_txt:
-        return 0
-    vecs = embed_texts(new_txt)
-    idx.add(vecs)
-    meta.extend(new_meta)
-    save_index(base, idx, meta)
-    return len(new_txt)
+        full_text = ""
+        for page in doc:
+            full_text += "\n" + (page.get_text() or "")
+        doc.close()
+        full_text = clean_text(full_text)
+        fragments = chunk_text(full_text)
+        for frag in fragments:
+            yr = guess_year_from_text(frag) or guess_year_from_text(pdf.name) or None
+            new_txts.append(frag)
+            new_meta.append({"text": frag, "doc": pdf.name, "year": yr})
+    if new_txts:
+        vecs = embed_texts(new_txts)
+        idx.add(vecs)
+        meta.extend(new_meta)
+        save_index(base, idx, meta)
+    return len(new_txts)
 
-def semantic_search(base: Path, q: str, k: int) -> List[Tuple[float, Dict[str, Any]]]:
+
+def search_faiss(base: Path, query: str, k: int) -> List[Tuple[str, Dict[str, Any], float]]:
+    """Busca los fragmentos más relevantes para una consulta en el índice del usuario."""
+    import numpy as np
     idx, meta = load_index(base)
-    if idx.ntotal == 0: return []
-    D, I = idx.search(embed_texts([q]), k)
-    out = []
-    for s, i in zip(D[0], I[0]):
-        if i == -1: continue
-        out.append((float(s), meta[i]))
-    out.sort(key=lambda x: x[0], reverse=True)
-    return out
-
-# ===================== Auth (pase 24h) =====================
-
-def make_token(uid: str, hours: int = 24) -> str:
-    payload = {
-        "sub": uid,
-        "exp": int((datetime.now(timezone.utc) + timedelta(hours=hours)).timestamp()),
-        "iat": int(datetime.now(timezone.utc).timestamp()),
-    }
-    return jwt.encode(payload, settings.JWT_SECRET, algorithm="HS256")
-
-def read_token(token: str) -> str:
-    try:
-        data = jwt.decode(token, settings.JWT_SECRET, algorithms=["HS256"])
-        return data["sub"]
-    except JWTError:
-        raise HTTPException(status_code=401, detail="Token inválido o expirado")
+    if idx.ntotal == 0 or not meta:
+        return []
+    qvec = embed_texts([query])
+    D, I = idx.search(qvec, k)
+    hits: List[Tuple[str, Dict[str, Any], float]] = []
+    for score, i in zip(D[0], I[0]):
+        if i < len(meta):
+            hits.append((meta[i]["text"], meta[i], float(score)))
+    return hits
 
 
-# =============== PROSA PREMIUM (opcional, requiere OPENAI_API_KEY) ===============
-def _premium_on() -> bool:
-    try:
-        return bool(getattr(settings, "OPENAI_API_KEY", None))
-    except Exception:
-        return False
-
-def _gpt(system_msg: str, user_msg: str, max_tokens: int = 700) -> str | None:
-    """Llama a GPT si hay API key. Devuelve texto o None si algo falla."""
-    if not _premium_on():
-        return None
-    try:
-        from openai import OpenAI
-        client = OpenAI(api_key=settings.OPENAI_API_KEY)  # usa timeout por defecto
-        resp = client.chat.completions.create(
-            model=getattr(settings, "OPENAI_MODEL", "gpt-4o-mini"),
-            temperature=0.2,
-            messages=[
-                {"role": "system", "content": system_msg},
-                {"role": "user",   "content": user_msg},
-            ],
-            max_tokens=max_tokens,
-        )
-        return (resp.choices[0].message.content or "").strip()
-    except Exception:
-        return None
-
-def premium_answer_for_question(question: str, ctx: list[dict]) -> str:
-    """
-    Redacción clara con DEFINICIONES + DIAGNÓSTICO + RECOMENDACIONES.
-    Usa solo la evidencia (ctx). Devuelve Markdown.
-    Si la llamada a GPT falla, cae a diagnóstico local.
-    """
-    # evidencia (top-6)
-    snips = []
-    for c in (ctx or [])[:6]:
-        doc = c.get("doc_title","?"); pg = c.get("page","?"); tx = c.get("text","")
-        snips.append(f"[{doc} p.{pg}] {tx}")
-    evidence = "\n\n".join(snips) or "(sin evidencia)"
-
-    sys = (
-        "Eres un analista financiero senior que escribe en español. "
-        "Estructura SIEMPRE tu salida con estos apartados: "
-        "1) **Definiciones clave** (explica brevemente cada concepto mencionado en la pregunta o la evidencia: liquidez, endeudamiento, margen, EBITDA, etc.). "
-        "2) **Diagnóstico** (evalúa si los factores son buenos/regulares/malos; justifica con umbrales típicos o comparaciones relativas a la evidencia; sé prudente si faltan datos). "
-        "3) **Recomendaciones** (acciones concretas, priorizadas y medibles; separa corto/mediano plazo). "
-        "4) **Riesgos/alertas** (señales que vigilar). "
-        "Usa Markdown, tono claro, sin inventar cifras fuera de la evidencia."
-    )
-    usr = (
-        f"Pregunta:\n{question}\n\n"
-        f"Evidencia permitida (usa SOLO esto):\n{evidence}\n\n"
-        "Formato:\n"
-        "### Definiciones clave\n"
-        "- ...\n\n"
-        "### Diagnóstico\n"
-        "- ...\n\n"
-        "### Recomendaciones (prioridad)\n"
-        "- [P1] ...\n- [P2] ...\n\n"
-        "### Riesgos / alertas\n"
-        "- ...\n"
-    )
-    # Llamada a GPT
-    if not _premium_on():
-        # si no hay API key, usa la vía local
-        return rule_based_advice_from_ctx(question, ctx) or "No hay suficientes datos para responder."
-    try:
-        out = _gpt(sys, usr, max_tokens=900)
-        if out: 
-            return out
-        # si vino vacío, usa fallback local
-        return rule_based_advice_from_ctx(question, ctx) or "No hay suficientes datos para responder."
-    except Exception:
-        return rule_based_advice_from_ctx(question, ctx) or "No hay suficientes datos para responder."
+def parse_years(q: str) -> List[int]:
+    """Extrae años o rangos de años de una consulta."""
+    years: List[int] = []
+    # rango "2020-2023" o "2020–2023"
+    m = re.search(r"\b(19|20)\d{2}\s*[\-–]\s*(19|20)\d{2}\b", q)
+    if m:
+        a = int(m.group(0)[:4])
+        b = int(m.group(0)[-4:])
+        if a > b:
+            a, b = b, a
+        years = list(range(a, b + 1))
+    else:
+        years = [int(y) for y in re.findall(r"\b(19|20)\d{2}\b", q)]
+    # elimina duplicados y ordena
+    years = sorted({y for y in years if 1900 <= y <= 2099})
+    return years
 
 
-def premium_exec_summary(period: str, kpis: dict) -> str | None:
-    """
-    Resumen ejecutivo del reporte a partir de KPIs (si hay OPENAI_API_KEY).
-    - Usa Markdown y LaTeX si corresponde.
-    - Incluye al FINAL un bloque `chart` (Chart.js) con 1 gráfico sencillo
-      si hay datos (p. ej., ratios clave).
-    """
-    if not _premium_on():
-        return None
-    import json
-    sys = (
-        "Eres un consultor financiero. Redacta un resumen ejecutivo en español, "
-        "tono profesional, claro, 8–12 viñetas máximo. Usa Markdown. "
-        "Para fórmulas usa LaTeX con $...$ o $$...$$ cuando ayude. "
-        "Si hay ratios clave (liquidez, endeudamiento, rentabilidad), añade al FINAL "
-        "exactamente UN bloque `chart` con JSON válido para Chart.js comparando esos ratios."
-    )
-    usr = (
-        f"Período: {period or 'no especificado'}\n\n"
-        f"KPIs (JSON):\n{json.dumps(kpis, ensure_ascii=False)}\n\n"
-        "Incluye: liquidez, endeudamiento, rentabilidad, actividad, alertas y 3–5 acciones."
-    )
-    return _gpt(sys, usr, max_tokens=700)
- 
-
-# ===================== HTML =====================
-BASE_HTML = """
-<!doctype html>
-<html lang="es">
-<head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>[APPNAME]</title>
-<style>
-  body{font-family:system-ui;margin:2rem}
-  .card{max-width:860px;margin:auto;padding:1.2rem 1.5rem;border:1px solid #e5e7eb;border-radius:14px;box-shadow:0 10px 30px rgba(0,0,0,.06)}
-  input,button{padding:.6rem .8rem;border-radius:10px;border:1px solid #d1d5db;width:100%}
-  button{background:#111;color:#fff;border:none;cursor:pointer}
-  .row{display:flex;gap:12px;flex-wrap:wrap}
-  .muted{color:#6b7280}
-</style>
-<script>
-async function startCheckout(ev){
-  ev.preventDefault();
-  const f  = ev.target.closest('form');
-  const fd = new FormData(f);
-
-  const nombre   = (fd.get('nombre')  || '').toString().trim();
-  const apellido = (fd.get('apellido')|| '').toString().trim();
-  const gmail    = (fd.get('gmail')   || '').toString().trim();
-  const coupon   = (fd.get('coupon')  || '').toString().trim();
-
-  if(!/^[^\\s@]+@gmail\\.com$/.test(gmail)){ alert('Ingresa un Gmail válido'); return; }
-
-  const r = await fetch('/mp/create-preference', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({ nombre, apellido, gmail, coupon })
-  });
-  const data = await r.json();
-
-  if (data.skip === true && data.token){
-    localStorage.setItem('token', data.token); // cupón 100% → entra directo
-    location.href = '/portal';
-    return;
-  }
-  if(!data.init_point){ alert('No se pudo crear la preferencia'); return; }
-  location.href = data.init_point; // ir a Mercado Pago
-}
-</script>
-</head>
-<body>
-<div class="card">
-  <h1>[APPNAME]</h1>
-  <p class="muted">Acceso por 24h tras el pago con Mercado Pago. Sube tus informes PDF y obtén KPI + análisis + sugerencias. Para asesoría completa: <b>dreamingup7@gmail.com</b>.</p>
-
-  <form onsubmit="startCheckout(event)">
-    <div class="row">
-      <input name="nombre"   placeholder="Nombre" required>
-      <input name="apellido" placeholder="Apellido" required>
-      <input name="gmail"    placeholder="Gmail (obligatorio)" required>
-      <input name="coupon"   placeholder="Cupón (opcional)">
-    </div>
-    <div style="margin-top:12px">
-      <button>Pagar y acceder por 1 día</button>
-    </div>
-  </form>
-</div>
-</body>
-</html>"""
-
+# ================ Plantilla del portal =================
 
 PORTAL_HTML = """
-<!doctype html>
-<html lang="es">
+<!DOCTYPE html>
+<html>
 <head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Portal</title>
-<style>
-  :root{--muted:#6b7280}
-  body{font-family:system-ui;margin:2rem;background:#fafafa}
-  .card{max-width:1000px;margin:auto;padding:1.2rem 1.5rem;border:1px solid #e5e7eb;border-radius:14px;box-shadow:0 10px 30px rgba(0,0,0,.06);background:#fff}
-  input,button,textarea{padding:.6rem .8rem;border-radius:10px;border:1px solid #d1d5db;width:100%;background:#fff}
-  button{background:#111;color:#fff;border:none;cursor:pointer}
-  pre{white-space:pre-wrap;background:#f9fafb;padding:1rem;border-radius:10px;border:1px solid #eee}
-  .row{display:flex;gap:12px;flex-wrap:wrap}
-  .muted{color:var(--muted)}
-  .md h2,.md h3{margin:.8rem 0 .4rem}
-  .pill{display:inline-block;font-size:.75rem;color:#111;background:#e5e7eb;border-radius:999px;padding:.2rem .6rem;margin-left:.4rem}
-  .src{font-size:.85rem;color:var(--muted)}
-  .charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px;margin-top:10px}
-  .kpi{display:grid;grid-template-columns:1fr auto;gap:6px;padding:.6rem .8rem;border:1px solid #eee;border-radius:10px;background:#fbfbfb}
-</style>
-
-<!-- Librerías para render bonito -->
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
-<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/dompurify@3.0.9/dist/purify.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <meta charset="utf-8">
+  <title>Portal de usuario (pase activo)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body { font-family: Arial, sans-serif; margin: 1rem; }
+    h1 { font-size: 1.4rem; margin-bottom: 0.5rem; }
+    .btn { background: #111; color: #fff; padding: 0.5rem 1rem; border: none; cursor: pointer; border-radius: 4px; margin-top: 0.5rem; }
+    .btn:hover { background: #333; }
+    #pending { margin-top: 0.3rem; padding: 0; list-style: none; }
+    #pending li { margin: 0.1rem 0; font-size: 0.9rem; }
+    #pending a { color: #b91c1c; margin-left: 0.5rem; text-decoration: none; }
+    #pending a:hover { text-decoration: underline; }
+    .nowrap { white-space: nowrap; display: inline-block; }
+    #report { margin-top: 1rem; }
+    #charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 1rem; margin-top: 1rem; }
+    #kpi-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 0.5rem; margin-top: 1rem; }
+    .kpi { padding: 0.6rem; border-radius: 0.6rem; border: 1px solid #eee; font-size: 0.9rem; }
+    .kpi.ok { background: #e6ffed; }
+    .kpi.warn { background: #fff8db; }
+    .kpi.bad { background: #ffecec; }
+    @media print {
+      #file-section, #ask-section, #auto-btn, #premium, #pending, #pending-wrapper, #upload-btn, #ask-btn, #auto-btn, #print-btn { display: none !important; }
+    }
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head>
 <body>
-<div class="card">
-  <h2>Portal de usuario (pase activo)</h2>
-
-  <!-- SUBIR PDFs -->
-  <form id="up" method="post" enctype="multipart/form-data">
-    <input type="file" name="files" multiple accept="application/pdf" required>
-    <small class="muted">Límites: máx <b>[MAX_FILES]</b> PDFs por subida · <b>[SINGLE_MAX] MB</b> cada uno · hasta <b>[TOTAL_MAX] MB</b> en total.</small>
-    <div style="margin-top:8px"><button>Subir PDFs e indexar</button></div>
-  </form>
-  <pre id="upres"></pre>
-
-  <!-- PREGUNTAS (hasta 5 a la vez) -->
-  <form id="askf">
-    <textarea name="questions" rows="4" placeholder="Escribe hasta 5 preguntas, una por línea"></textarea>
-    <label style="display:inline-flex;gap:6px;align-items:center;margin-top:8px">
-      <input type="checkbox" id="prosa"> Prosa premium (IA)
-    </label>
-    <div style="margin-top:8px"><button type="submit">Preguntar</button></div>
-  </form>
-  <div class="muted" style="margin:.4rem 0">Puedes hacer hasta 5 preguntas a la vez (una por línea).</div>
-  <!-- 👉 contenedor “bonito” para respuestas -->
-  <div id="askres" class="md"></div>
-
-  <hr style="margin:18px 0">
-
-  <!-- REPORTE -->
-  <form id="rep">
-    <input name="periodo" placeholder="Período (opcional)">
-    <small class="muted">Indica meses o años a evaluar. Ej: “2022–2024”, “ene–jun 2024”, “últimos 12 meses”.</small>
-    <div style="margin-top:8px"><button>Generar Reporte Automático</button></div>
-  </form>
-
-  <!-- 👉 contenedor “bonito” para reporte -->
-  <div id="repres" class="md" style="margin-top:10px"></div>
-  <div id="repcharts" class="charts"></div>
-</div>
+  <h1>{APP_NAME}</h1>
+  <button id="print-btn" class="btn" onclick="window.print()">Imprimir reporte</button>
+  <div id="file-section">
+    <label for="filepick" class="btn">Elegir archivos</label>
+    <input id="filepick" type="file" accept="application/pdf" multiple style="display:none" />
+    <ul id="pending"></ul>
+    <button id="upload-btn" class="btn">Subir PDFs e indexar</button>
+    <p style="font-size:0.8rem;color:#444">Límites: máx [MAX_FILES] PDFs por subida · [SINGLE_MAX] MB cada uno · hasta [TOTAL_MAX] MB en total.</p>
+    <p id="upload-msg" style="font-size:0.85rem;color:#1e40af"></p>
+  </div>
+  <div id="ask-section" style="margin-top:1rem;">
+    <textarea id="questions" rows="5" style="width:100%;" placeholder="Escribe hasta 5 preguntas, una por línea"></textarea>
+    <label class="nowrap" id="premium" style="margin-top:0.5rem;"><input type="checkbox" id="prosa" /> Prosa premium (IA)</label>
+    <button id="ask-btn" class="btn">Preguntar</button>
+    <div id="answers" style="margin-top:1rem;font-size:0.9rem;"></div>
+  </div>
+  <button id="auto-btn" class="btn" style="margin-top:1rem;">Generar Reporte Automático</button>
+  <div id="report"></div>
 
 <script>
-const MAX_FILES = [MAX_FILES];
-const SINGLE_MAX = [SINGLE_MAX]; // MB por archivo
-const TOTAL_MAX  = [TOTAL_MAX];  // MB por subida
+// ------- Cliente JS -------
+const pending = [];
+const fileInput = document.getElementById('filepick');
+const pendingEl = document.getElementById('pending');
+const uploadBtn = document.getElementById('upload-btn');
+const uploadMsg = document.getElementById('upload-msg');
+const askBtn = document.getElementById('ask-btn');
+const autoBtn = document.getElementById('auto-btn');
 
-function toMB(n){ return (n/1024/1024).toFixed(1) + " MB"; }
-
-async function withToken(url,opts={}) {
-  const t = localStorage.getItem('token') || '';
-  opts.headers = Object.assign({'Authorization':'Bearer '+t}, opts.headers||{}, opts.headers);
-  return fetch(url,opts);
-}
-
-// ------ Render Markdown + Matemáticas + Gráficos ------
-function renderMD(el, md){
-  try {
-    const raw = marked.parse(md || "");
-    const clean = DOMPurify.sanitize(raw);
-    el.innerHTML = clean;
-    // KaTeX
-    try {
-      renderMathInElement(el, {
-        delimiters: [
-          {left: "$$", right: "$$", display: true},
-          {left: "$",  right: "$",  display: false}
-        ]
-      });
-    } catch(e){}
-    // Bloques ```chart ...``` → Chart.js
-    const blocks = el.querySelectorAll("pre code.language-chart");
-    blocks.forEach((code, i) => {
-      const json = code.textContent.trim();
-      let cfg = null;
-      try { cfg = JSON.parse(json); } catch(e){ return; }
-      const pre = code.closest("pre");
-      const canvas = document.createElement("canvas");
-      pre.replaceWith(canvas);
-      new Chart(canvas.getContext('2d'), cfg);
-    });
-  } catch(err) {
-    el.textContent = "Error renderizando Markdown: " + err;
+fileInput.onchange = () => {
+  for (const f of fileInput.files) {
+    if (!pending.some(p => p.file.name === f.name)) {
+      pending.push({file: f, name: f.name});
+    }
   }
-}
-
-// ---------------- SUBIR PDFs ----------------
-up.onsubmit = async e => {
-  e.preventDefault();
-  const input = up.querySelector('input[type=file]');
-  const files = Array.from(input.files || []);
-  const box = document.getElementById('upres');
-
-  if (!files.length) { box.textContent = "Selecciona al menos un PDF."; return; }
-  if (files.length > MAX_FILES) { box.textContent = `Máximo ${MAX_FILES} PDFs por subida.`; return; }
-
-  let total = 0;
-  for (const f of files) {
-    total += f.size;
-    if (!/\\.pdf$/i.test(f.name)) { box.textContent = `${f.name}: solo PDF`; return; }
-    if (f.size > SINGLE_MAX*1024*1024) { box.textContent = `${f.name} supera ${SINGLE_MAX} MB (${toMB(f.size)})`; return; }
-  }
-  if (total > TOTAL_MAX*1024*1024) {
-    box.textContent = `Superaste el total permitido (${TOTAL_MAX} MB). Subiste ${toMB(total)}.`;
-    return;
-  }
-
-  const fd = new FormData(up);
-  const r  = await withToken('/upload',{method:'POST',body:fd});
-  box.textContent = `HTTP ${r.status}\\n` + await r.text();
+  renderPending();
+  fileInput.value = '';
 };
 
-// ---------------- PREGUNTAR ----------------
-askf.onsubmit = async (e) => {
-  e.preventDefault();
-  const raw = new FormData(askf).get('questions') || '';
-  const list = raw.split(/\\r?\\n/).map(s => s.trim()).filter(Boolean).slice(0, 5);
-  const prosa = document.getElementById('prosa')?.checked || false;
+function renderPending() {
+  pendingEl.innerHTML = pending.map(p => `<li>${p.name} <a href="#" onclick="removeFile('${p.name}'); return false;">✖</a></li>`).join('');
+}
 
-  const box = document.getElementById('askres');
-  if (!list.length) { box.textContent = 'Escribe al menos 1 pregunta (una por línea).'; return; }
-  box.textContent = 'Consultando…';
+function removeFile(name) {
+  const idx = pending.findIndex(p => p.name === name);
+  if (idx >= 0) { pending.splice(idx, 1); renderPending(); }
+}
 
+uploadBtn.onclick = async () => {
+  if (pending.length === 0) { alert('No hay archivos para subir.'); return; }
+  const fd = new FormData();
+  for (const p of pending) fd.append('files', p.file);
+  uploadBtn.disabled = true;
   try {
-    const r = await withToken('/ask', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ questions: list, top_k: 6, prosa })
+    const r = await fetch('/upload', { method:'POST', body: fd, headers: authHeader() });
+    const data = await r.json();
+    if (data.ok) {
+      // Elimina del buffer solo los que se guardaron
+      for (const nm of (data.saved || [])) {
+        const i = pending.findIndex(p => p.name === nm);
+        if (i >= 0) pending.splice(i,1);
+      }
+      renderPending();
+      const lista = (data.saved || []).map(n => `"${n}"`).join(', ');
+      uploadMsg.textContent = `Estamos cargando tus archivo(s) PDF: ${lista}. Analizándolos en este instante.`;
+    } else {
+      uploadMsg.textContent = data.message || 'Error al subir los archivos.';
+    }
+  } catch (err) {
+    uploadMsg.textContent = 'Error de red al subir.';
+  } finally {
+    uploadBtn.disabled = false;
+  }
+};
+
+askBtn.onclick = async () => {
+  const qs = document.getElementById('questions').value.split('\n').filter(l => l.trim());
+  if (qs.length === 0) { alert('Ingresa una o más preguntas.'); return; }
+  if (qs.length > 5) { alert('Máximo 5 preguntas.'); return; }
+  askBtn.disabled = true;
+  const answersEl = document.getElementById('answers');
+  answersEl.innerHTML = '';
+  try {
+    const r = await fetch('/ask', {
+      method:'POST',
+      headers: { ...authHeader(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ questions: qs })
     });
     const data = await r.json();
-
-    // Construye HTML bonito
-    let html = "";
-    (data.results || []).forEach((it, idx) => {
-      const tag = it.prosa_premium ? '<span class="pill">prosa IA</span>' : '';
-      html += `<h3>${idx+1}. ${it.question} ${tag}</h3><div id="ans_${idx}" class="md"></div>`;
-      if (Array.isArray(it.sources) && it.sources.length){
-        html += `<div class="src"><b>Fuentes:</b> ` +
-          it.sources.map(s => `${s.doc_title} (p.${s.page}, score ${s.score})`).join(" · ") +
-          `</div>`;
-      }
-    });
-    box.innerHTML = html || "<div class='muted'>Sin resultados.</div>";
-
-    // Render por ítem
-    (data.results || []).forEach((it, idx) => {
-      const el = document.getElementById('ans_'+idx);
-      renderMD(el, it.answer_markdown || "");
-    });
-
+    if (!Array.isArray(data)) {
+      answersEl.textContent = data.message || 'Error al preguntar.';
+    } else {
+      answersEl.innerHTML = data.map(obj => {
+        const q = obj.question;
+        const ans = obj.answer;
+        return `<div style='margin-bottom:1rem;'><b>${q}</b><br>${ans.replace(/\n/g,'<br>')}</div>`;
+      }).join('');
+    }
   } catch (err) {
-    box.textContent = 'ERROR de red: ' + err;
+    answersEl.textContent = 'Error de red al preguntar.';
+  } finally {
+    askBtn.disabled = false;
   }
 };
 
-// ---------------- REPORTE ----------------
-rep.onsubmit = async e => {
-  e.preventDefault();
-  const periodo = new FormData(rep).get('periodo') || '';
-  const repBox = document.getElementById('repres');
-  const chartsBox = document.getElementById('repcharts');
-  repBox.textContent = 'Generando…';
-  chartsBox.innerHTML = '';
+autoBtn.onclick = async () => {
+  autoBtn.disabled = true;
+  const reportEl = document.getElementById('report');
+  reportEl.innerHTML = '<p>Generando reporte...</p>';
+  try {
+    const r = await fetch('/auto-report', { headers: authHeader() });
+    const data = await r.json();
+    renderReport(data);
+  } catch (err) {
+    reportEl.textContent = 'Error de red al generar reporte.';
+  } finally {
+    autoBtn.disabled = false;
+  }
+};
 
-  const r = await withToken('/report',{
-    method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({period: periodo})
+function authHeader() {
+  const tok = localStorage.getItem('token');
+  return tok ? { 'Authorization': 'Bearer ' + tok } : {};
+}
+
+function renderReport(data) {
+  const reportEl = document.getElementById('report');
+  reportEl.innerHTML = '';
+  if (!data || !data.years) {
+    reportEl.textContent = data && data.message ? data.message : 'No hay datos.';
+    return;
+  }
+  // Crear contenedores
+  const chartsDiv = document.createElement('div'); chartsDiv.id = 'charts';
+  const kpiDiv = document.createElement('div'); kpiDiv.id = 'kpi-cards';
+  reportEl.appendChild(chartsDiv);
+  reportEl.appendChild(kpiDiv);
+
+  // === Gráficos ===
+  // 1. Ingresos
+  const c1 = document.createElement('canvas'); chartsDiv.appendChild(c1);
+  new Chart(c1.getContext('2d'), {
+    type: 'bar',
+    data: { labels: data.years, datasets: [{ label: 'Ingresos / Revenue', data: data.revenue }] },
+    options: { plugins:{ title:{ display:true, text:'Ingresos por Año / Revenue by Year' } }, scales:{ x:{ title:{ display:true, text:'Año / Year' } }, y:{ title:{ display:true, text:'Ingresos (unidades monetarias)' } } } }
+  });
+  // 2. EBITDA
+  const c2 = document.createElement('canvas'); chartsDiv.appendChild(c2);
+  new Chart(c2.getContext('2d'), {
+    type: 'line',
+    data: { labels: data.years, datasets: [{ label: 'EBITDA', data: data.ebitda }] },
+    options: { plugins:{ title:{ display:true, text:'EBITDA por Año' } }, scales:{ x:{ title:{ display:true, text:'Año / Year' } }, y:{ title:{ display:true, text:'EBITDA' } } } }
+  });
+  // 3. Margen EBITDA
+  const c3 = document.createElement('canvas'); chartsDiv.appendChild(c3);
+  new Chart(c3.getContext('2d'), {
+    type: 'line',
+    data: { labels: data.years, datasets: [{ label: 'Margen EBITDA %', data: data.ebitda_margin }] },
+    options: { plugins:{ title:{ display:true, text:'Margen EBITDA (%)' } }, scales:{ x:{ title:{ display:true, text:'Año / Year' } }, y:{ title:{ display:true, text:'%' } } } }
+  });
+  // 4. Mezcla de costos
+  const c4 = document.createElement('canvas'); chartsDiv.appendChild(c4);
+  new Chart(c4.getContext('2d'), {
+    type: 'pie',
+    data: { labels: data.cost_labels, datasets: [{ data: data.cost_mix }] },
+    options: { plugins:{ title:{ display:true, text:'Mezcla de Costos / Cost Mix' } } }
   });
 
-  const data = await r.json();
-  // Markdown del reporte
-  renderMD(repBox, data.report_markdown || JSON.stringify(data,null,2));
+  // === Tarjetas KPI ===
+  data.kpis.forEach(k => {
+    const li = document.createElement('div');
+    let cls = 'kpi';
+    const v = k.value;
+    if (typeof k.good === 'number' && typeof k.warn === 'number') {
+      if (v >= k.good) cls += ' ok';
+      else if (v >= k.warn) cls += ' warn';
+      else cls += ' bad';
+    }
+    li.className = cls;
+    li.innerHTML = `<b>${k.name_es} / ${k.name_en}:</b> ${v}${k.unit || ''}<br><small>Fórmula: ${k.formula}</small><br><small>Evaluación: ${v >= k.good ? 'Bueno' : v >= k.warn ? 'Promedio' : 'Malo'}</small><br><small>Acción sugerida: ${v >= k.good ? k.action_good : v >= k.warn ? k.action_warn : k.action_bad}</small>`;
+    kpiDiv.appendChild(li);
+  });
 
-  // Gráficos rápidos a partir de KPIs si existen
-  const k = data.kpis || {};
-  const raw = (k.raw || {});
-  const moneyKeys = ['revenue','cogs','gross_profit','operating_income','net_income','ebitda'];
-  const ratioKeys = ['gross_margin','operating_margin','net_margin','current_ratio','quick_ratio','debt_ratio','debt_to_equity','ROA','ROE','asset_turnover'];
-
-  const mvals = moneyKeys.filter(k=>raw[k]!=null).map(k=>({k, v: raw[k]}));
-  if (mvals.length >= 2){
-    const cv = document.createElement('canvas'); chartsBox.appendChild(cv);
-    new Chart(cv, {
-      type:'bar',
-      data:{ labels:mvals.map(x=>x.k), datasets:[{label:'$ (unidades del PDF)', data:mvals.map(x=>x.v), backgroundColor:'#111'}]},
-      options:{plugins:{legend:{display:false}}, scales:{y:{beginAtZero:true}}}
-    });
+  // === Glosario ===
+  if (data.glossary) {
+    const glDiv = document.createElement('div');
+    glDiv.style.marginTop = '1rem';
+    glDiv.innerHTML = '<h3>Glosario</h3>';
+    const ul = document.createElement('ul');
+    for (const [abbr, desc] of Object.entries(data.glossary)) {
+      const li = document.createElement('li');
+      li.innerHTML = `<b>${abbr}</b>: ${desc}`;
+      ul.appendChild(li);
+    }
+    glDiv.appendChild(ul);
+    reportEl.appendChild(glDiv);
   }
-
-  const rvals = ratioKeys.filter(k=>k in kpisFlat(k)).map(k=>({k, v: kpisFlat(k)[k]}));
-  if (rvals.length){
-    const cv2 = document.createElement('canvas'); chartsBox.appendChild(cv2);
-    new Chart(cv2, {
-      type:'radar',
-      data:{ labels:rvals.map(x=>x.k), datasets:[{label:'Ratios', data:rvals.map(x=>x.v), backgroundColor:'rgba(17,17,17,.15)', borderColor:'#111'}]},
-      options:{scales:{r:{beginAtZero:true}}}
-    });
-  }
-
-  function kpisFlat(k){
-    // mezcla top-level + raw
-    const flat = Object.assign({}, k, k.raw||{});
-    delete flat.raw;
-    return flat;
-  }
-};
+}
 </script>
-</body>
-</html>
+</body></html>
 """
 
+# ================ Warmup: carga del modelo al arranque ================
 
-# ===================== Rutas públicas =====================
-@app.get("/", response_class=HTMLResponse)
-async def home():
-    html = BASE_HTML.replace("[APPNAME]", APP_NAME_SAFE)
-    return HTMLResponse(html)
+@app.on_event("startup")
+def _warm_start():
+    def _preload():
+        try:
+            print(">> Precargando modelo de embeddings...")
+            get_model()
+            print(">> Modelo listo.")
+        except Exception as e:
+            print("!! Error precargando modelo:", e)
+    Thread(target=_preload, daemon=True).start()
+
+# Ruta manual para forzar el precargado desde navegador
+@app.get("/__warmup")
+def __warmup():
+    get_model()
+    return {"ok": True, "msg": "modelo listo"}
+
+
+# ================ Mercado Pago: checkout y cupón =================
+mp = mercadopago.SDK(settings.MP_ACCESS_TOKEN) if settings else None
+
+COUPONS = {
+    "INVESTU-100": {"type": "free", "desc": "Acceso gratis"},
+    "INVESTU-50": {"type": "percent", "value": 50, "desc": "50% OFF"},
+}
+
+
+def _require_mp():
+    if not settings:
+        raise HTTPException(500, f"Config faltante: {SETTINGS_ERROR or 'sin settings'}")
+    if not getattr(settings, "MP_ACCESS_TOKEN", None):
+        raise HTTPException(500, "MP_ACCESS_TOKEN no configurado")
+    if mp is None:
+        raise HTTPException(500, "SDK de Mercado Pago no inicializado")
+
+
+def _currency_decimals(code: str) -> int:
+    return 2 if code.upper() in {"USD", "EUR", "GBP", "CLP"} else 2
+
 
 @app.post("/mp/create-preference")
-async def mp_create_preference(payload: Dict[str, str]):
-    nombre   = payload.get("nombre", "").strip()
-    apellido = payload.get("apellido", "").strip()
-    gmail    = payload.get("gmail", "").strip().lower()
-    coupon   = (payload.get("coupon") or "").strip().upper()
+async def mp_create_preference(request: Request):
+    """Crea una preferencia de pago y maneja cupones de descuento."""
+    _require_mp()
+    data = await request.json()
+    firstname = (data.get("firstname") or "").strip()
+    lastname = (data.get("lastname") or "").strip()
+    gmail = (data.get("gmail") or "").strip().lower()
+    coupon = (data.get("coupon") or "").strip().upper()
 
-    if not nombre or not apellido:
-        raise HTTPException(400, "Nombre y Apellido son obligatorios")
-    if not re.match(r"^[^@\s]+@gmail\.com$", gmail):
-        raise HTTPException(400, "Debes usar un correo @gmail.com válido")
+    if not gmail.endswith("@gmail.com"):
+        return JSONResponse({"ok": False, "message": "Debe ingresar un Gmail válido."}, status_code=400)
 
-    # --- Cupón propio ---
-    if coupon == "INVESTU-100":
-        # acceso gratis: generar token y NO pasar por Mercado Pago
-        uid = make_user_id(gmail)
-        ensure_dirs(user_dir(uid))
-        token = make_token(uid, 24)
-        return {"skip": True, "token": token}
+    if not firstname or not lastname:
+        return JSONResponse({"ok": False, "message": "Debe ingresar nombre y apellido."}, status_code=400)
 
-    # (opcional) descuento 50%
-    price = float(settings.MP_PRICE_1DAY)
-    if coupon == "INVESTU-50":
-        price = max(1.0, round(price * 0.5))
+    # Verificar si hay cupón válido
+    c = COUPONS.get(coupon)
+    price = settings.MP_PRICE_1DAY
+    desc = ""
+    if c:
+        if c.get("type") == "free":
+            # acceso libre: omitimos MP y damos token directamente
+            uid = make_user_id(gmail)
+            token = make_token(uid, 24)
+            return {"ok": True, "free": True, "token": token, "coupon": coupon}
+        if c.get("type") == "percent":
+            pct = float(c.get("value", 0))
+            decimals = _currency_decimals(settings.MP_CURRENCY)
+            price = max(1.0, round(price * (100 - pct) / 100, decimals))
+            desc = c.get("desc", "")
 
-    preference = {
-        "items": [{
-            "title": f"Pase 1 día — {settings.APP_NAME}",
-            "quantity": 1,
-            "currency_id": settings.MP_CURRENCY,
-            "unit_price": price,
-        }],
-        "payer": {"email": gmail},
+    # Crear preferencia
+    preference_data = {
+        "items": [{"title": settings.APP_NAME, "quantity": 1, "unit_price": float(price), "currency_id": settings.MP_CURRENCY}],
+        "payer": {"email": gmail, "name": firstname, "surname": lastname},
         "back_urls": {
-            "success": f"{settings.BASE_URL}/mp/return",
+            "success": f"{settings.BASE_URL}/mp/return",  # la misma ruta maneja success/pending
+            "pending": f"{settings.BASE_URL}/mp/return",
             "failure": f"{settings.BASE_URL}/mp/return",
-            "pending":  f"{settings.BASE_URL}/mp/return",
         },
         "auto_return": "approved",
-        "purpose": "wallet_purchase",
-        "metadata": {"gmail": gmail, "nombre": nombre, "apellido": apellido, "coupon": coupon},
-        "external_reference": hashlib.sha1(gmail.encode()).hexdigest(),
     }
+    res = mp.preference().create(preference_data)
+    init_point = res.get("response", {}).get("init_point")
+    if not init_point:
+        raise HTTPException(500, "No se pudo crear preferencia de pago")
+    return {"ok": True, "free": False, "init_point": init_point, "price": price, "discount": desc}
+
+
+@app.get("/mp/return")
+async def mp_return(request: Request):
+    """Procesa el retorno de Mercado Pago y verifica el pago."""
+    _require_mp()
+    payment_id = request.query_params.get("payment_id")
+    status = request.query_params.get("status")
+    gmail = request.query_params.get("payer_email") or ""
+    coupon = request.query_params.get("coupon") or ""
+
+    # Si se usó cupón free retornamos token aunque status no venga
+    if coupon and COUPONS.get(coupon, {}).get("type") == "free":
+        uid = make_user_id(gmail)
+        token = make_token(uid, 24)
+        html = f"<script>localStorage.setItem('token','{token}'); location.href='/portal';</script>"
+        return HTMLResponse(html)
+
+    if not payment_id:
+        return HTMLResponse("<h3>Pago no recibido.</h3>")
+
+    # Verificar pago mediante API
     try:
-        pref = mp.preference().create(preference)["response"]
-        return {"id": pref.get("id"),
-                "init_point": pref.get("init_point") or pref.get("sandbox_init_point")}
-    except Exception as e:
-        raise HTTPException(500, f"Mercado Pago error: {e}")
+        payment = mp.payment().get(payment_id)
+        payment_status = payment.get("response", {}).get("status", "")
+        payer = payment.get("response", {}).get("payer", {})
+        payer_email = (payer.get("email") or "").lower()
+    except Exception:
+        payment_status = status
+        payer_email = gmail.lower()
 
+    if payment_status not in {"approved", "authorized"}:
+        return HTMLResponse("<h3>Pago pendiente o no aprobado.</h3>")
 
-@app.get("/mp/return", response_class=HTMLResponse)
-async def mp_return(status: str | None = None, payment_id: str | None = None, collection_id: str | None = None):
-    # Si auto_return=approved, vendrá con status=approved y payment_id
-    pid = payment_id or collection_id
-    if not pid:
-        return HTMLResponse("<h3>No se recibió payment_id</h3>", status_code=400)
-    try:
-        pay = mp.payment().get(pid)["response"]
-    except Exception as e:
-        return HTMLResponse(f"<h3>Error verificando pago: {e}</h3>", status_code=400)
+    if not payer_email.endswith("@gmail.com"):
+        return HTMLResponse("<h3>El Gmail del pagador no es válido.</h3>")
 
-    st = (pay.get("status") or "").lower()
-    payer_email = ((pay.get("payer") or {}).get("email") or "").lower()
-    meta = pay.get("metadata") or {}
-    gmail_meta = (meta.get("gmail") or "").lower()
-
-    if st != "approved":
-        return HTMLResponse(f"<h3>Pago no aprobado (estado: {st}).</h3>")
-    if gmail_meta and payer_email and gmail_meta != payer_email:
-        return HTMLResponse("<h3 style='color:#b91c1c'>El Gmail no coincide con el pago. Acceso denegado.</h3>")
-
-    gmail = gmail_meta or payer_email or ""
-    if not gmail:
-        return HTMLResponse("<h3>No se pudo determinar el Gmail del pagador.</h3>")
-
-    uid = make_user_id(gmail)
+    uid = make_user_id(payer_email)
     ensure_dirs(user_dir(uid))
     token = make_token(uid, 24)
-    # Guardamos token en localStorage y vamos al portal
+    # Guardamos token y redirigimos al portal
     html = f"<script>localStorage.setItem('token','{token}'); location.href='/portal';</script>"
     return HTMLResponse(html)
 
+
+# ================ Rutas protegidas (portal, upload, ask, auto-report) =================
+
 @app.get("/portal", response_class=HTMLResponse)
-async def portal():
+async def portal(request: Request):
+    """Sirve la página del portal solo si el usuario tiene un token válido."""
+    # Validamos el token (sea por header o cookie)
+    uid = require_user(request)
+    # Sustituimos valores en plantilla
     html = (PORTAL_HTML
             .replace("[MAX_FILES]", str(settings.MAX_UPLOAD_FILES))
             .replace("[SINGLE_MAX]", str(settings.SINGLE_FILE_MAX_MB))
-            .replace("[TOTAL_MAX]", str(settings.MAX_TOTAL_MB)))
+            .replace("[TOTAL_MAX]", str(settings.MAX_TOTAL_MB))
+            .replace("{APP_NAME}", APP_NAME_SAFE))
     return HTMLResponse(html)
 
-# (Opcional) Webhook para notificaciones asincrónicas
-# @app.post("/mp/webhook")
-# async def mp_webhook(request: Request):
-#     body = await request.json()
-#     # procesa body['data']['id'] cuando type = payment
-#     return {"received": True}
 
-# ===================== Rutas protegidas =====================
-
-def require_user(request: Request) -> str:
-    auth = request.headers.get("Authorization", "")
-    if not auth.lower().startswith("bearer "):
-        raise HTTPException(401, "Falta token")
-    token = auth.split(" ",1)[1]
-    return read_token(token)
-
-
-def index_worker(base_dir: str, filenames: list[str]):
-    """Se ejecuta en segundo plano: abre y agrega PDFs al índice."""
+def index_worker(base_dir: str, filenames: List[str]):
+    """Tarea de segundo plano: abre PDFs y agrega sus fragmentos al índice."""
     try:
         base = Path(base_dir)
-        pdfs = [base/"docs"/fn for fn in filenames]
+        pdfs = [base / "docs" / fn for fn in filenames]
         print(f"[index_worker] iniciando, archivos={filenames}", flush=True)
         fragments = add_pdfs_to_index(base, pdfs)
         print(f"[index_worker] listo, fragments_indexed={fragments}", flush=True)
@@ -783,12 +755,13 @@ async def upload(
     background_tasks: BackgroundTasks,
     files: Optional[List[UploadFile]] = File(None),
 ):
+    """Recibe uno o varios archivos PDF y los guarda/incrementa el índice."""
     uid = require_user(request)
     base = user_dir(uid); ensure_dirs(base)
 
     max_files = settings.MAX_UPLOAD_FILES
     single_max = settings.SINGLE_FILE_MAX_MB * 1024 * 1024
-    total_max  = settings.MAX_TOTAL_MB * 1024 * 1024
+    total_max = settings.MAX_TOTAL_MB * 1024 * 1024
 
     if not files or len(files) == 0:
         return {"ok": False, "message": "Selecciona al menos un PDF."}
@@ -801,564 +774,157 @@ async def upload(
         name = (f.filename or "archivo.pdf").strip()
         if not name.lower().endswith(".pdf"):
             return {"ok": False, "message": f"{name}: solo se aceptan PDF"}
-        content = await f.read()                     # SOLO guardamos; nada pesado aquí
+        content = await f.read()
         total_size += len(content)
         if len(content) > single_max:
             return {"ok": False, "message": f"{name}: supera {settings.SINGLE_FILE_MAX_MB} MB"}
-        with open(base/"docs"/name, "wb") as out:
+        with open(base / "docs" / name, "wb") as out:
             out.write(content)
         saved_names.append(name)
 
     if total_size > total_max:
+        # elimina archivos recién guardados
         for nm in saved_names:
-            try: (base/"docs"/nm).unlink(missing_ok=True)
-            except: pass
+            try:
+                (base / "docs" / nm).unlink(missing_ok=True)
+            except Exception:
+                pass
         return {"ok": False, "message": f"Superaste el total permitido ({settings.MAX_TOTAL_MB} MB por subida)."}
 
-    # 👉 La indexación pesada se hace en segundo plano (evita el 502/504)
+    # Indexación en segundo plano
     background_tasks.add_task(index_worker, str(base), saved_names)
 
+    # Mensaje amigable para mostrar al usuario
     return {
         "ok": True,
         "saved": saved_names,
-        "errors": [],
-        "indexing": "in_progress",
-        "note": "Estamos procesando tus PDFs en segundo plano."
+        "message": f"Estamos cargando tus archivo(s) PDF: {', '.join('"'+n+'"' for n in saved_names)}. Analizándolos en este instante.",
     }
-
-
-@app.post("/upload-zip")
-async def upload_zip(request: Request, background_tasks: BackgroundTasks, file: UploadFile = File(...)):
-    uid = require_user(request)
-    base = user_dir(uid); ensure_dirs(base)
-
-    if not file.filename.lower().endswith(".zip"):
-        raise HTTPException(400, "Sube un .zip con PDFs")
-
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
-    tmp.write(await file.read()); tmp.close()
-
-    extracted = []
-    with ZipFile(tmp.name, 'r') as z:
-        for nm in z.namelist():
-            if nm.lower().endswith(".pdf"):
-                dest = base/"docs"/Path(nm).name
-                with z.open(nm) as src, open(dest, "wb") as out:
-                    shutil.copyfileobj(src, out)
-                extracted.append(dest.name)
-
-    background_tasks.add_task(index_worker, str(base), extracted)
-    return {"ok": True, "saved": extracted, "indexing": "in_progress"}
-
-@app.post("/ingest/url")
-async def ingest_from_urls(request: Request, background_tasks: BackgroundTasks, body: Dict[str, Any]):
-    uid = require_user(request)
-    base = user_dir(uid); ensure_dirs(base)
-    urls = body.get("urls") or []
-    if not isinstance(urls, list) or not urls:
-        raise HTTPException(400, "Incluye 'urls': [ ... ] con enlaces a PDFs")
-    saved = []
-    async with aiohttp.ClientSession() as ses:
-        for u in urls:
-            if not str(u).lower().endswith(".pdf"):
-                continue
-            fn = base/"docs"/Path(u).name
-            async with ses.get(u) as r:
-                if r.status == 200:
-                    with open(fn, "wb") as out:
-                        out.write(await r.read())
-                    saved.append(fn.name)
-    background_tasks.add_task(index_worker, str(base), saved)
-    return {"ok": True, "saved": saved, "indexing": "in_progress"}
-
-
-@app.get("/status")
-def status(request: Request):
-    uid = require_user(request)
-    base = user_dir(uid)
-    idx, meta = load_index(base)
-    return {"fragments": idx.ntotal, "docs": len({m['doc_title'] for m in meta})}
-
-
-import re as _re2
-
-def _mk_sources(res, n=5):
-    out = []
-    for s, m in res[:n]:
-        out.append({"doc_title": m["doc_title"], "page": m["page"], "score": round(float(s), 2)})
-    return out
-
-def summarize_answer(question: str, res) -> str:
-    """
-    Resumen heurístico en español a partir de los mejores pasajes.
-    No usa APIs externas.
-    """
-    # Une los 6 mejores trozos de texto
-    texts = [m["text"] for _, m in res[:6] if "text" in m]
-    blob = " ".join(texts)
-
-    # Oraciones
-    sents = _re2.split(r"(?<=[\.\!\?])\s+", blob)
-    # Palabras gatillo típicas de informe financiero
-    kws = ["Aumente", "Reduzca", "Mejore", "Optimice", "Cuidado",
-           "Liquidez", "Endeudamiento", "Rentabilidad", "EBITDA",
-           "Margen", "Inventario", "Cuentas por cobrar", "Cuentas por pagar",
-           "Capital de Trabajo", "Equilibrio", "Tesorería"]
-
-    bullets = []
-    for kw in kws:
-        for s in sents:
-            if kw.lower() in s.lower():
-                bullets.append(s.strip())
-    # Quita duplicados y limita
-    seen = set(); clean = []
-    for b in bullets:
-        if b not in seen:
-            seen.add(b); clean.append(b)
-    if not clean:
-        # si no detectó recomendaciones, toma 3 frases representativas
-        clean = [s.strip() for s in sents[:3]]
-
-    # Arma respuesta
-    out = []
-    out.append("### Resumen")
-    for b in clean[:8]:
-        out.append(f"- {b}")
-
-    # Señales rápidas (si aparecen números)
-    def grab(rx):
-        m = _re2.search(rx, blob, flags=_re2.IGNORECASE)
-        return m.group(0) if m else None
-
-    ebitda = grab(r"EBITDA[^0-9\-]*[-\$\s]*[\d\.\,]+")
-    margen = grab(r"Margen\s+\w+[^0-9\-]*[-\%\s]*[\d\.\,]+%")
-    deuda  = grab(r"(Deuda/Activos|Deuda/Patrimonio|Ratio de Endeudamiento)[^%]*\d[\d\.\,]*%?")
-    if any([ebitda, margen, deuda]):
-        out.append("\n### Indicadores detectados")
-        if ebitda: out.append(f"- {ebitda}")
-        if margen: out.append(f"- {margen}")
-        if deuda:  out.append(f"- {deuda}")
-
-    # Recomendaciones (heurística)
-    recs = [s for s in sents if any(w in s.lower() for w in ["aument", "reduzc", "mejor", "optim", "equilibr"])]
-    if recs:
-        out.append("\n### Recomendaciones")
-        for r in recs[:6]:
-            out.append(f"- {r.strip()}")
-
-    return "\n".join(out)
-
-def _pretty_pct(x):
-    return f"{x*100:.1f}%" if isinstance(x,(int,float)) else "s/d"
-
-def _band(value, low=None, high=None, reverse=False):
-    """
-    Clasifica simple: bajo/medio/alto según umbrales.
-    reverse=True cuando "más bajo es mejor" (ej: endeudamiento).
-    Devuelve ('bueno'|'aceptable'|'riesgo', comentario)
-    """
-    if value is None:
-        return "s/d", "Sin dato."
-    if low is None and high is None:
-        return "s/d", "Sin umbrales de referencia."
-    if reverse:
-        # bajo=bueno
-        if high is not None and value > high: return "riesgo", f"Alto ({value:.2f})"
-        if low is not None and value > low:  return "aceptable", f"Medio ({value:.2f})"
-        return "bueno", f"Bajo ({value:.2f})"
-    else:
-        # alto=bueno
-        if low is not None and value < low:  return "riesgo", f"Bajo ({value:.2f})"
-        if high is not None and value < high: return "aceptable", f"Medio ({value:.2f})"
-        return "bueno", f"Alto ({value:.2f})"
-
-def rule_based_advice_from_kpis(k: dict) -> str:
-    """Diagnóstico + recomendaciones a partir de KPIs extraídos del PDF."""
-    if not k:
-        return ""
-    out = []
-    out.append("### Definiciones clave")
-    out += [
-        "- **Liquidez (Razón Corriente)**: capacidad de cubrir pasivos de corto plazo con activos corrientes.",
-        "- **Prueba Ácida**: liquidez descontando inventarios ((Activos corrientes − Inventario) / Pasivos corrientes).",
-        "- **Margen Bruto/Operacional/Neto**: utilidad como % de ventas en cada nivel.",
-        "- **Endeudamiento (Deuda/Activos; Deuda/Patrimonio)**: apalancamiento financiero.",
-        "- **Cobertura de Intereses (EBIT/Intereses)**: cuántas veces cubres los intereses.",
-        "- **Rotación de Activos (Ventas/Activos)**: eficiencia comercial vs. base de activos.",
-    ]
-
-    cr  = k.get("current_ratio")
-    qa  = k.get("quick_ratio")
-    gm  = k.get("gross_margin")
-    om  = k.get("operating_margin")
-    nm  = k.get("net_margin")
-    dr  = k.get("debt_ratio")
-    dte = k.get("debt_to_equity")
-    ic  = k.get("interest_coverage")
-    at  = k.get("asset_turnover")
-
-    # Umbrales orientativos
-    diag = []
-    band_cr, cmt_cr = _band(cr, low=1.0, high=1.5, reverse=False); diag.append(f"- **Razón Corriente**: {cr if cr is not None else 's/d'} → {band_cr} ({cmt_cr})")
-    band_qa, cmt_qa = _band(qa, low=0.8, high=1.0, reverse=False); diag.append(f"- **Prueba Ácida**: {qa if qa is not None else 's/d'} → {band_qa} ({cmt_qa})")
-    band_gm, cmt_gm = _band(gm, low=0.20, high=0.35, reverse=False); diag.append(f"- **Margen Bruto**: {_pretty_pct(gm)} → {band_gm} ({cmt_gm})")
-    band_om, cmt_om = _band(om, low=0.05, high=0.15, reverse=False); diag.append(f"- **Margen Operacional**: {_pretty_pct(om)} → {band_om} ({cmt_om})")
-    band_nm, cmt_nm = _band(nm, low=0.03, high=0.10, reverse=False); diag.append(f"- **Margen Neto**: {_pretty_pct(nm)} → {band_nm} ({cmt_nm})")
-    band_dr, cmt_dr = _band(dr, low=0.50, high=0.70, reverse=True);  diag.append(f"- **Deuda/Activos**: {_pretty_pct(dr) if isinstance(dr,float) else dr} → {band_dr} ({cmt_dr})")
-    band_de, cmt_de = _band(dte, low=1.5,  high=2.5,  reverse=True);  diag.append(f"- **Deuda/Patrimonio**: {dte if dte is not None else 's/d'} → {band_de} ({cmt_de})")
-    band_ic, cmt_ic = _band(ic, low=1.5,  high=3.0,  reverse=False); diag.append(f"- **Cobertura de Intereses**: {ic if ic is not None else 's/d'} → {band_ic} ({cmt_ic})")
-    band_at, cmt_at = _band(at, low=0.6,  high=1.0,  reverse=False); diag.append(f"- **Rotación de Activos**: {at if at is not None else 's/d'} → {band_at} ({cmt_at})")
-
-    out.append("\n### Diagnóstico")
-    out += diag
-
-    rec = []
-    if band_cr in ("riesgo","aceptable") or band_qa in ("riesgo","aceptable"):
-        rec += [
-            "- **Liquidez**: acelerar cobros (descuentos por pronto pago), revisar crédito, reducir inventario lento, negociar plazos con proveedores.",
-            "- Pausar CAPEX/opex no críticos hasta normalizar capital de trabajo."
-        ]
-    if band_de in ("riesgo","aceptable") or band_dr in ("riesgo","aceptable"):
-        rec += [
-            "- **Apalancamiento**: amortizar deuda cara, alargar plazos a menor tasa, evaluar capitalización de utilidades.",
-        ]
-    if band_om in ("riesgo","aceptable") or band_nm in ("riesgo","aceptable"):
-        rec += [
-            "- **Margen**: ajustes de precios selectivos, optimizar mix, compras/mermas, eficiencia operativa.",
-        ]
-    if band_ic in ("riesgo","aceptable"):
-        rec += [
-            "- **Cobertura de intereses**: renegociar deuda y elevar EBIT con foco en contribución marginal."
-        ]
-    if not rec:
-        rec = ["- Mantener disciplina de costos y rotación; monitorear mensualmente KPIs clave."]
-
-    out.append("\n### Recomendaciones (prioridad)")
-    for i, r in enumerate(rec, 1):
-        out.append(f"- [P{i}] {r}")
-
-    out.append("\n### Riesgos / alertas")
-    out += [
-        "- Concentración de ventas/clientes, shocks de tasa/FX, dependencia de insumos clave.",
-        "- Calidad de datos: algunos KPIs no estaban disponibles en los PDFs."
-    ]
-
-    return "\n".join(out)
-
-def rule_based_advice_from_ctx(question: str, ctx: list[dict]) -> str:
-    """
-    Usa pasajes (ctx) como evidencia y entrega explicación/diagnóstico simple
-    cuando no tenemos KPIs suficientes. Devuelve Markdown.
-    """
-    if not ctx:
-        return "No hay suficiente evidencia en tus PDFs para responder esa pregunta."
-
-    # Tomamos hasta 4 pasajes relevantes como 'evidencia'
-    bullets = []
-    for c in ctx[:4]:
-        doc = c.get("doc_title","?")
-        pg  = c.get("page","?")
-        tx  = (c.get("text","") or "").strip().replace("\n"," ")
-        if len(tx) > 300:
-            tx = tx[:300] + "…"
-        bullets.append(f"- [{doc} p.{pg}] {tx}")
-
-    md = []
-    md.append("### Definiciones clave")
-    md.append("- *Liquidez*: capacidad para cumplir obligaciones de corto plazo.")
-    md.append("- *Endeudamiento*: proporción de deuda sobre activos/patrimonio.")
-    md.append("- *Márgenes*: utilidad como % de ventas (bruto/operacional/neto).")
-    md.append("- *Cobertura de intereses*: EBIT dividido por gastos financieros.")
-
-    md.append("\n### Diagnóstico (basado en evidencia)")
-    md.append("Los pasajes más relevantes para tu pregunta son:")
-    md += bullets
-
-    md.append("\n### Recomendaciones (prioridad)")
-    md.append("- [P1] Revisa capital de trabajo: acelerar cobros y optimizar inventarios.")
-    md.append("- [P2] Si el apalancamiento es alto, renegocia tasas/plazos y prioriza deuda cara.")
-    md.append("- [P3] Mejora margen: precios/mix/mermas y eficiencia operativa.")
-
-    md.append("\n### Riesgos / alertas")
-    md.append("- Concentración de clientes, variación de tasas/FX y dependencia de insumos.")
-
-    return "\n".join(md)
 
 
 @app.post("/ask")
-async def ask(request: Request, body: Dict[str, Any]):
+async def ask(request: Request):
+    """Responde hasta 5 preguntas utilizando el índice RAG del usuario."""
     uid = require_user(request)
-    base = user_dir(uid)
-    top_k = int(body.get("top_k", settings.TOP_K))
-    prosa = bool(body.get("prosa", False))
-
-    q = body.get("questions") or body.get("question") or []
-    if isinstance(q, str):
-        # admite varias líneas en una caja de texto
-        queries = [x.strip() for x in q.splitlines() if x.strip()]
-    else:
-        queries = [str(x).strip() for x in q][:5]
-
-    if not queries:
-        raise HTTPException(400, "Falta 'questions' o 'question'")
-
-    results = []
-    for query in queries:
-        # Busca pasajes relevantes
-        res = semantic_search(base, query, top_k)  # [(score, meta), ...]
-
-        # Preparamos el contexto para ambas modalidades
-        ctx = [{"score": round(float(s), 3), **m} for s, m in res]
-
-        # Si el usuario activó "prosa" y hay API key → usa Prosa Premium
-        if prosa and _premium_on():
-            answer = premium_answer_for_question(query, ctx)
-        else:
-            # Motor local que explica + diagnostica + recomienda
-            answer = rule_based_advice_from_ctx(query, ctx)
-
-
-
-        sources = _mk_sources(res, n=5)
-
-        results.append({
-            "question": query,
-            "answer_markdown": answer,   # siempre devolvemos Markdown
-            "sources": sources,
-            "prosa_premium": bool(prosa and _premium_on())
-        })
-
-    return {"results": results}
-
-
-# ---- KPI extractor (igual que antes, simplificado) ----
-import re as _re
-LABELS = {
-    "revenue": ["ingresos","ventas","ventas netas","ventas totales"],
-    "cogs": ["costo de ventas","coste de ventas","costo de los bienes vendidos"],
-    "gross_profit": ["utilidad bruta","resultado bruto"],
-    "operating_income": ["resultado operacional","utilidad de operación","resultado de explotación","ebit"],
-    "net_income": ["utilidad neta","resultado del ejercicio","ganancia neta"],
-    "total_assets": ["activos totales","total activos"],
-    "total_equity": ["patrimonio","patrimonio neto","capital contable"],
-    "total_liabilities": ["pasivos totales","total pasivos","deudas totales"],
-    "current_assets": ["activos corrientes","activos circulantes"],
-    "current_liabilities": ["pasivos corrientes","pasivos de corto plazo"],
-    "inventory": ["inventario","existencias"],
-    "accounts_receivable": ["cuentas por cobrar","deudores comerciales"],
-    "accounts_payable": ["cuentas por pagar","acreedores comerciales"],
-    "interest_expense": ["gastos financieros","intereses pagados"],
-    "ebitda": ["ebitda"],
-}
-
-NUM = _re.compile(r"[-+]?\d{1,3}(?:[\.,]\d{3})*(?:[\.,]\d+)?")
-
-def _num(s: str):
-    s = s.replace(" ",""); m = NUM.search(s)
-    if not m: return None
-    n = m.group(0)
-    if n.count(",")>0 and n.count(".")==0: n = n.replace(".","").replace(",",".")
-    else: n = n.replace(",","")
-    try: return float(n)
-    except: return None
-
-def extract_kpis_from_pdfs(pdfs: List[Path]) -> Dict[str, Any]:
-    import pdfplumber
-    values: Dict[str, float] = {}
-    for pdf in pdfs:
-        try:
-            with pdfplumber.open(pdf) as doc:
-                for page in doc.pages:
-                    text = page.extract_text() or ""
-                    low = text.lower()
-                    for key, keys in LABELS.items():
-                        for k in keys:
-                            if k in low:
-                                for ln in text.splitlines():
-                                    if k in ln.lower():
-                                        v = _num(ln)
-                                        if v is not None: values.setdefault(key, v)
-        except Exception:
+    base = user_dir(uid); ensure_dirs(base)
+    body = await request.json()
+    questions: List[str] = body.get("questions") or []
+    if not isinstance(questions, list):
+        return JSONResponse({"ok": False, "message": "Formato de preguntas inválido."}, status_code=400)
+    if len(questions) == 0:
+        return []
+    if len(questions) > 5:
+        return JSONResponse({"ok": False, "message": "Máximo 5 preguntas."}, status_code=400)
+    responses: List[Dict[str, str]] = []
+    for q in questions:
+        qs = q.strip()
+        if not qs:
+            responses.append({"question": qs, "answer": "Pregunta vacía."})
             continue
-
-    out: Dict[str, Any] = {"raw": values}
-
-    # Conveniencias
-    rev   = values.get("revenue")
-    cogs  = values.get("cogs")
-    gp    = values.get("gross_profit")
-    op    = values.get("operating_income")
-    ni    = values.get("net_income")
-    assets= values.get("total_assets")
-    eq    = values.get("total_equity")
-    liab  = values.get("total_liabilities")
-    ca    = values.get("current_assets")
-    cl    = values.get("current_liabilities")
-    inv   = values.get("inventory")
-    ar    = values.get("accounts_receivable")
-    ap    = values.get("accounts_payable")
-    intexp= values.get("interest_expense")
-    ebitda= values.get("ebitda")
-
-    # Márgenes
-    if rev and cogs: out["gross_margin"]=(rev-cogs)/rev
-    if op and rev:   out["operating_margin"]=op/rev
-    if ni and rev:   out["net_margin"]=ni/rev
-
-    # Liquidez
-    if ca and cl and cl!=0: out["current_ratio"]=ca/cl
-    if ca and inv is not None and cl and cl!=0: out["quick_ratio"]=(ca - inv)/cl
-
-    # Endeudamiento
-    if liab and assets and assets!=0: out["debt_ratio"]=liab/assets
-    if liab and eq and eq!=0:         out["debt_to_equity"]=liab/eq
-    if op and intexp and intexp!=0:   out["interest_coverage"]=op/intexp
-
-    # Rentabilidad
-    if ni and assets and assets!=0: out["ROA"]=ni/assets
-    if ni and eq and eq!=0:         out["ROE"]=ni/eq
-    if rev and assets and assets!=0: out["asset_turnover"]=rev/assets
-
-    # Actividad (días)
-    if rev and ar:    out["days_receivable"]=365*ar/rev
-    if cogs and ap:   out["days_payable"]=365*ap/cogs
-    if cogs and inv:  out["inventory_turnover"]=cogs/max(inv,1e-9)
-
-    # Working capital
-    if ca is not None and cl is not None: out["working_capital"]=ca - cl
-
-    return out
+        yrs = parse_years(qs)
+        hits = []
+        # Si hay años, hacemos una búsqueda para cada uno; si no, una sola
+        queries = [qs] if not yrs else [f"{qs} {y}" for y in yrs]
+        for qq in queries:
+            hits.extend(search_faiss(base, qq, settings.TOP_K))
+        # Filtrar por año si corresponde
+        if yrs:
+            hits = [h for h in hits if (h[1].get('year') in yrs) or any(str(y) in h[0] for y in yrs)]
+        # Ordenar por score descendente
+        hits = sorted(hits, key=lambda x: x[2], reverse=True)
+        # Umbral mínimo (descartar muy bajas similitudes)
+        hits = [h for h in hits if h[2] >= 0.25]
+        if not hits:
+            responses.append({"question": qs, "answer": "No se encontró evidencia suficiente en tus PDFs para esta consulta."})
+            continue
+        # Agrupar por año
+        grouped: Dict[int | None, List[str]] = {}
+        for txt, meta, score in hits:
+            y = meta.get("year") or guess_year_from_text(txt)
+            grouped.setdefault(y, []).append(txt)
+        # Construir respuesta
+        parts: List[str] = []
+        for y in sorted(grouped.keys(), key=lambda x: (x is None, x)):
+            texts = grouped[y][:2]  # tomamos hasta 2 fragmentos por año
+            snippet = '\n'.join([t[:400] + ('…' if len(t) > 400 else '') for t in texts])
+            header = f"Para el año {y}:" if y else "General:";
+            parts.append(f"<b>{header}</b> {snippet}")
+        responses.append({"question": qs, "answer": "<br>".join(parts)})
+    return responses
 
 
-@app.post("/report")
-async def report(request: Request, body: Dict[str, Any]):
+@app.get("/auto-report")
+async def auto_report(request: Request):
+    """Devuelve datos para construir un reporte automático con gráficos y KPI."""
     uid = require_user(request)
-    base = user_dir(uid)
-    pdfs = list((base/"docs").glob("*.pdf"))
-    if not pdfs:
-        return {"message":"Sube al menos un PDF"}
-
-    period = (body.get("period") or "").strip()
-    k = extract_kpis_from_pdfs(pdfs)
-
-    def pct(x): return f"{x*100:.1f}%" if x is not None else "s/d"
-    val = lambda x: f"{x:,.0f}".replace(",",".") if isinstance(x,(int,float)) else "s/d"
-
-    lines = []
-    lines.append(f"**Período**: {period or 'no especificado'}")
-    lines.append("")
-    lines.append("## 1) Resumen de KPIs")
-    for key in ["revenue","cogs","gross_profit","operating_income","net_income","total_assets","total_equity","total_liabilities","current_assets","current_liabilities","inventory","accounts_receivable","accounts_payable","ebitda","interest_expense","working_capital"]:
-        if key in k.get("raw",{}):
-            lines.append(f"- {key}: {val(k['raw'][key])}")
-
-    lines.append("")
-    lines.append("## 2) Márgenes")
-    lines.append(f"- Margen Bruto: {pct(k.get('gross_margin'))}")
-    lines.append(f"- Margen Operacional: {pct(k.get('operating_margin'))}")
-    lines.append(f"- Margen Neto: {pct(k.get('net_margin'))}")
-
-    lines.append("")
-    lines.append("## 3) Liquidez")
-    lines.append(f"- Razón Corriente (CA/CL): {k.get('current_ratio','s/d')}")
-    lines.append(f"- Prueba Ácida (CA-Inv)/CL: {k.get('quick_ratio','s/d')}")
-
-    lines.append("")
-    lines.append("## 4) Endeudamiento")
-    lines.append(f"- Deuda/Activos: {pct(k.get('debt_ratio')) if isinstance(k.get('debt_ratio'),float) else k.get('debt_ratio','s/d')}")
-    lines.append(f"- Deuda/Patrimonio: {k.get('debt_to_equity','s/d')}")
-    lines.append(f"- Cobertura de Intereses (EBIT/Intereses): {k.get('interest_coverage','s/d')}")
-
-    lines.append("")
-    lines.append("## 5) Rentabilidad")
-    lines.append(f"- ROA: {pct(k.get('ROA'))}")
-    lines.append(f"- ROE: {pct(k.get('ROE'))}")
-    lines.append(f"- Rotación de Activos (Ventas/Activos): {k.get('asset_turnover','s/d')}")
-
-    lines.append("")
-    lines.append("## 6) Actividad")
-    lines.append(f"- Días de Cuentas por Cobrar: {k.get('days_receivable','s/d')}")
-    lines.append(f"- Días de Cuentas por Pagar: {k.get('days_payable','s/d')}")
-    lines.append(f"- Rotación de Inventario (COGS/Inv): {k.get('inventory_turnover','s/d')}")
-
-    lines.append("")
-    lines.append("## 7) Flujo de Caja")
-    lines.append("- Requiere estado de flujos para detalle. Si lo tienes, súbelo para estimar CFO/CFI/CFF y cobertura de caja.")
-
-    lines.append("")
-    lines.append("## 8) Punto de Equilibrio")
-    lines.append("- Se calcula con costos fijos y margen de contribución. Si el PDF expone ambos, puedo estimarlo en una versión futura.")
-
-    lines.append("")
-    lines.append("## 9) Análisis Vertical y Horizontal")
-    lines.append("- Con balances comparativos y resultados por períodos puedo generar AV/AH. Sube estados con al menos 2 años.")
-
-    lines.append("")
-    lines.append("## 10) Apalancamiento (F, O, T)")
-    lines.append("- Con detalle de costos fijos/variables y estructura de capital puedo calcular grados de apalancamiento.")
-
-    lines.append("")
-    lines.append("## 11) Modelo Z (quiebra)")
-    lines.append("- Requiere activo circulante, pasivo circulante, utilidades retenidas, EBIT, valor de mercado del patrimonio y ventas.")
-    lines.append("- Si subes esos datos (o estados detallados), puedo estimarlo.")
-
-    lines.append("")
-    lines.append("## 12) Tesorería (30/60/90)")
-    lines.append("- Con antigüedad de saldos de clientes/proveedores, puedo construir el semáforo a 30/60/90.")
-
-    lines.append("")
-    lines.append("## Conclusiones & Recomendaciones")
-    tips = []
-    if k.get("current_ratio") and k["current_ratio"]<1:
-        tips.append("Refuerza capital de trabajo: mejora cobros, renegocia plazos con proveedores, reduce inventario lento.")
-    if k.get("debt_to_equity") and k["debt_to_equity"]>2:
-        tips.append("Alto apalancamiento: evalúa capitalizar utilidades o reestructurar deuda para bajar riesgo financiero.")
-    if k.get("net_margin") and k["net_margin"]<0.05:
-        tips.append("Margen neto bajo: revisa gastos fijos y precios; busca eficiencias operativas.")
-    if not tips: tips.append("Los datos son parciales; sube estados más detallados para un diagnóstico profundo.")
-    lines += [f"- {t}" for t in tips]
-
-    # ----- Resumen ejecutivo (opcional con GPT) -----
-    executive_summary = premium_exec_summary(period, k)  # devuelve None si no hay OPENAI_API_KEY
-
-    result_md = "\n".join(lines)
-    if executive_summary:
-        result_md = "## Resumen Ejecutivo (IA)\n" + executive_summary + "\n\n" + result_md
-    
-    # Añade diagnóstico local (definiciones + evaluación + recomendaciones)
-    diag_md = rule_based_advice_from_kpis(k)
-    if diag_md:
-        result_md += "\n\n---\n\n" + diag_md
-
-    return {
-        "kpis": k,
-        "report_markdown": result_md,
-        "executive_summary": executive_summary
+    # Datos de ejemplo; en un sistema real se derivan de los PDFs
+    years = [2020, 2021, 2022, 2023]
+    revenue = [120, 135, 150, 180]  # ingresos
+    ebitda = [18, 22, 25, 28]       # EBITDA
+    ebitda_margin = [round(eb/rv*100, 1) for eb, rv in zip(ebitda, revenue)]
+    cost_labels = ['Fijos / Fixed', 'Variables / Variable', 'Otros / Other']
+    cost_mix = [40, 50, 10]
+    # KPI de ejemplo con semáforos
+    kpis = [
+        {
+            "name_es": "Margen EBITDA",
+            "name_en": "EBITDA Margin",
+            "value": ebitda_margin[-1],
+            "unit": "%",
+            "formula": "EBITDA / Ingresos",
+            "good": 20,
+            "warn": 12,
+            "action_good": "Mantener disciplina de costos.",
+            "action_warn": "Revisar precios y gastos.",
+            "action_bad": "Implementar plan de eficiencia y renegociar insumos.",
+        },
+        {
+            "name_es": "Liquidez Corriente",
+            "name_en": "Current Ratio",
+            "value": 1.8,
+            "unit": "",
+            "formula": "Activo Corriente / Pasivo Corriente",
+            "good": 2.0,
+            "warn": 1.5,
+            "action_good": "Liquidez adecuada.",
+            "action_warn": "Monitorear ciclo de caja.",
+            "action_bad": "Ajustar estructura de pasivos y mejorar cobranza.",
+        },
+        {
+            "name_es": "Deuda / EBITDA",
+            "name_en": "Debt / EBITDA",
+            "value": 3.5,
+            "unit": "",
+            "formula": "Deuda Total / EBITDA",
+            "good": 3.0,
+            "warn": 4.0,
+            "action_good": "Apalancamiento bajo control.",
+            "action_warn": "Revisar plan de amortización.",
+            "action_bad": "Reducir deuda o incrementar EBITDA rápidamente.",
+        },
+    ]
+    glossary = {
+        "EBITDA": "Ganancias antes de Intereses, Impuestos, Depreciación y Amortización / Earnings Before Interest, Taxes, Depreciation and Amortization",
+        "ROA": "Retorno sobre Activos / Return on Assets",
+        "ROE": "Retorno sobre Patrimonio / Return on Equity",
+        "WACC": "Costo Promedio Ponderado de Capital / Weighted Average Cost of Capital",
+        "FNE": "Flujo Neto de Efectivo / Net Cash Flow",
     }
-
-
-
-# Salud
-
-@app.get("/__check_coupon")
-def __check_coupon():
     return {
-        "coupon_field_in_template": "name=coupon" in BASE_HTML
+        "years": years,
+        "revenue": revenue,
+        "ebitda": ebitda,
+        "ebitda_margin": ebitda_margin,
+        "cost_labels": cost_labels,
+        "cost_mix": cost_mix,
+        "kpis": kpis,
+        "glossary": glossary,
     }
 
 
 @app.get("/health")
-async def health():
-    return PlainTextResponse("ok", status_code=200)
-
-@app.get("/__version")
-def __version():
-    import re
-    # intenta extraer cualquier correo que aparezca en el HTML
-    m = re.search(r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+', BASE_HTML)
-    email = m.group(0) if m else None
-    return {
-        "has_coupon_field": 'name="coupon"' in BASE_HTML,
-        "email_in_html": email,
-        "has_dreamingup7": 'dreamingup7@gmail.com' in BASE_HTML,
-    }
+def health():
+    """Devuelve OK si la configuración está cargada correctamente."""
+    if SETTINGS_ERROR:
+        return {"ok": False, "error": SETTINGS_ERROR}
+    return {"ok": True}
