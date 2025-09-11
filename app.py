@@ -33,7 +33,7 @@ from typing import Optional
 
 import mercadopago
 from fastapi import FastAPI, Request, UploadFile, File, HTTPException, BackgroundTasks
-from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic_settings import BaseSettings
 from jose import jwt, JWTError
@@ -80,28 +80,10 @@ except Exception as e:
 APP_NAME_SAFE = (settings.APP_NAME if settings else "Asesor Financiero")
 
 app = FastAPI(title=(settings.APP_NAME if settings else "Finance"))
-
-# CORS: admitir apex y www + localhost
-allowed = {
-    "http://localhost:8000", "http://127.0.0.1:8000",
-    "https://inbestu.com", "https://www.inbestu.com",
-    "https://vedetodo.online", "https://www.vedetodo.online",
-}
-# También la BASE_URL exacta por si cambia
-if settings and getattr(settings, "BASE_URL", None):
-    allowed.add(settings.BASE_URL)
-    # variante http/https por si toca
-    if settings.BASE_URL.startswith("https://"):
-        allowed.add(settings.BASE_URL.replace("https://","http://"))
-    if settings.BASE_URL.startswith("http://"):
-        allowed.add(settings.BASE_URL.replace("http://","https://"))
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=list(allowed),
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=["*"], allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"],
 )
 
 # ---- Warm-up: precargar el modelo en segundo plano al iniciar ----
@@ -129,20 +111,9 @@ def __warmup():
 mp = mercadopago.SDK(settings.MP_ACCESS_TOKEN) if settings else None
 # --- Cupones propios del comercio ---
 COUPONS = {
-    "INVESTU-100": {"type": "free", "desc": "Acceso gratis"},  # ← cambia aquí
+    "INVESTU-100": {"type": "free", "desc": "Acceso gratis"},
     "INVESTU-50":  {"type": "percent", "value": 50, "desc": "50% OFF"},
-    "PASE-GRATIS": {"type": "free", "desc": "Gratis 1 día"},
 }
-
-# Guardas de configuración para MP
-def _require_mp():
-    if not settings:
-        raise HTTPException(500, f"Config faltante: {SETTINGS_ERROR or 'sin settings'}")
-    if not getattr(settings, "MP_ACCESS_TOKEN", None):
-        raise HTTPException(500, "MP_ACCESS_TOKEN no configurado")
-    if mp is None:
-        raise HTTPException(500, "SDK de Mercado Pago no inicializado")
-
 
 
 # ===================== Embeddings & RAG (igual) =====================
@@ -203,108 +174,47 @@ def idx_paths(base: Path) -> Dict[str, Path]:
     return {"faiss": base/".rag_index"/"index.faiss", "meta": base/".rag_index"/"metadata.jsonl"}
 
 def load_index(base: Path):
-    import faiss
+    import faiss  # import aquí
     p = idx_paths(base)
     dim = get_model().get_sentence_embedding_dimension()
     if p["faiss"].exists() and p["meta"].exists():
         idx = faiss.read_index(str(p["faiss"]))
-        meta = []
-        with open(p["meta"], "r", encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line: 
-                    continue
-                try:
-                    meta.append(json.loads(line))
-                except Exception:
-                    # ignora línea parcial si justo se leyó durante escritura
-                    continue
+        meta = [json.loads(x) for x in open(p["meta"], "r", encoding="utf-8") if x.strip()]
         return idx, meta
     return faiss.IndexFlatIP(dim), []
 
-
 def save_index(base: Path, idx, meta: List[Dict[str, Any]]):
-    import faiss, os  # import aquí
+    import faiss  # import aquí
     p = idx_paths(base)
     p["faiss"].parent.mkdir(parents=True, exist_ok=True)
-
-    # 1) FAISS atómico
-    tmp_faiss = p["faiss"].with_suffix(p["faiss"].suffix + ".tmp")
-    faiss.write_index(idx, str(tmp_faiss))
-    os.replace(tmp_faiss, p["faiss"])
-
-    # 2) metadata.jsonl atómico
-    tmp_meta = p["meta"].with_suffix(p["meta"].suffix + ".tmp")
-    with open(tmp_meta, "w", encoding="utf-8") as f:
+    faiss.write_index(idx, str(p["faiss"]))
+    with open(p["meta"], "w", encoding="utf-8") as f:
         for m in meta:
             f.write(json.dumps(m, ensure_ascii=False) + "\n")
-    os.replace(tmp_meta, p["meta"])
-
 
 def add_pdfs_to_index(base: Path, pdfs: List[Path]) -> int:
-    import fitz  # PyMuPDF
+    import fitz  # PyMuPDF (import aquí)
     ensure_dirs(base)
     idx, meta = load_index(base)
-
     new_txt, new_meta = [], []
-
     for pdf in pdfs:
-        if not pdf.exists():
+        if not pdf.exists(): 
             continue
-        try:
-            with fitz.open(pdf) as doc:
-                for page_num, page in enumerate(doc, start=1):
-                    # 1) Texto "normal"
-                    text = clean_text(page.get_text("text") or "")
-
-                    # 2) Fallback por bloques (capta tablas/cabeceras en varios PDFs)
-                    if len(text) < 50:
-                        try:
-                            blocks = page.get_text("blocks") or []
-                            blk_txt = " ".join(
-                                b[4] for b in blocks
-                                if isinstance(b, (list, tuple)) and len(b) > 4 and isinstance(b[4], str)
-                            )
-                            text = clean_text(blk_txt or text)
-                        except Exception:
-                            pass
-
-                    # 3) Fallback pdfplumber (último recurso)
-                    if len(text) < 50:
-                        try:
-                            import pdfplumber
-                            with pdfplumber.open(str(pdf)) as pp:
-                                pn = page_num - 1
-                                if 0 <= pn < len(pp.pages):
-                                    text2 = pp.pages[pn].extract_text() or ""
-                                    text = clean_text(text2) or text
-                        except Exception:
-                            pass
-
-                    if len(text) < 50:
-                        # página sin texto útil (escaneada o imagen)
-                        continue
-
-                    for ck in chunk_text(text):
-                        new_txt.append(ck)
-                        new_meta.append({
-                            "doc_title": pdf.name,
-                            "page": page_num,
-                            "text": ck
-                        })
-        except Exception as e:
-            print(f"[add_pdfs_to_index] ERROR abriendo {pdf}: {e}", flush=True)
-            continue
-
+        with fitz.open(pdf) as doc:
+            for page_num, page in enumerate(doc, start=1):
+                text = clean_text(page.get_text("text") or "")
+                if len(text) < 50:
+                    continue
+                for ck in chunk_text(text):
+                    new_txt.append(ck)
+                    new_meta.append({"doc_title": pdf.name, "page": page_num, "text": ck})
     if not new_txt:
         return 0
-
     vecs = embed_texts(new_txt)
     idx.add(vecs)
     meta.extend(new_meta)
     save_index(base, idx, meta)
     return len(new_txt)
-
 
 def semantic_search(base: Path, q: str, k: int) -> List[Tuple[float, Dict[str, Any]]]:
     idx, meta = load_index(base)
@@ -319,51 +229,20 @@ def semantic_search(base: Path, q: str, k: int) -> List[Tuple[float, Dict[str, A
 
 # ===================== Auth (pase 24h) =====================
 
-import secrets
-
-def _session_code(n: int = 6) -> str:
-    # Código amigable (evita 0/O y 1/I)
-    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
-    return "".join(secrets.choice(alphabet) for _ in range(n))
-
 def make_token(uid: str, hours: int = 24) -> str:
-    scode = _session_code()
     payload = {
         "sub": uid,
-        "code": scode,  # ← código visible para el usuario
         "exp": int((datetime.now(timezone.utc) + timedelta(hours=hours)).timestamp()),
         "iat": int(datetime.now(timezone.utc).timestamp()),
     }
     return jwt.encode(payload, settings.JWT_SECRET, algorithm="HS256")
 
-def read_token_full(token: str) -> dict:
+def read_token(token: str) -> str:
     try:
-        return jwt.decode(token, settings.JWT_SECRET, algorithms=["HS256"])
+        data = jwt.decode(token, settings.JWT_SECRET, algorithms=["HS256"])
+        return data["sub"]
     except JWTError:
         raise HTTPException(status_code=401, detail="Token inválido o expirado")
-
-def _get_token_from_request(request: Request) -> str | None:
-    # 1) Authorization: Bearer xxx
-    auth = request.headers.get("Authorization", "")
-    if auth.lower().startswith("bearer "):
-        return auth.split(" ", 1)[1]
-    # 2) Cookie: token=xxx
-    cookie = request.headers.get("cookie") or request.headers.get("Cookie") or ""
-    for part in cookie.split(";"):
-        k, _, v = part.strip().partition("=")
-        if k == "token" and v:
-            return v
-    return None
-
-def read_token(token: str) -> str:
-    data = read_token_full(token)
-    return data["sub"]
-
-def require_user(request: Request) -> str:
-    token = _get_token_from_request(request)
-    if not token:
-        raise HTTPException(401, "Falta token")
-    return read_token(token)
 
 
 # =============== PROSA PREMIUM (opcional, requiere OPENAI_API_KEY) ===============
@@ -468,7 +347,6 @@ def premium_exec_summary(period: str, kpis: dict) -> str | None:
  
 
 # ===================== HTML =====================
-
 BASE_HTML = """
 <!doctype html>
 <html lang="es">
@@ -504,12 +382,10 @@ async function startCheckout(ev){
   const data = await r.json();
 
   if (data.skip === true && data.token){
-  localStorage.setItem('token', data.token);
-  const secure = (location.protocol === 'https:') ? '; Secure' : '';
-  document.cookie = 'token=' + data.token + '; Path=/; Max-Age=86400; SameSite=Lax' + secure;
-  location.href = '/portal';
-  return;
-}
+    localStorage.setItem('token', data.token); // cupón 100% → entra directo
+    location.href = '/portal';
+    return;
+  }
   if(!data.init_point){ alert('No se pudo crear la preferencia'); return; }
   location.href = data.init_point; // ir a Mercado Pago
 }
@@ -518,7 +394,7 @@ async function startCheckout(ev){
 <body>
 <div class="card">
   <h1>[APPNAME]</h1>
-  <p class="muted">Acceso por 24h tras el pago con Mercado Pago. Sube tus informes PDF y obtén KPI + análisis + sugerencias. Para soporte: <b>dreamingup7@gmail.com</b>.</p>
+  <p class="muted">Acceso por 24h tras el pago con Mercado Pago. Sube tus informes PDF y obtén KPI + análisis + sugerencias. Para asesoría completa: <b>dreamingup7@gmail.com</b>.</p>
 
   <form onsubmit="startCheckout(event)">
     <div class="row">
@@ -552,19 +428,13 @@ PORTAL_HTML = """
   .row{display:flex;gap:12px;flex-wrap:wrap}
   .muted{color:var(--muted)}
   .md h2,.md h3{margin:.8rem 0 .4rem}
-  .pill{display:inline-block;font-size:.75rem;color:#111;background:#e5e7eb;border-radius:999px;padding:.2rem .6rem;margin-left:.4rem;white-space:nowrap}
+  .pill{display:inline-block;font-size:.75rem;color:#111;background:#e5e7eb;border-radius:999px;padding:.2rem .6rem;margin-left:.4rem}
   .src{font-size:.85rem;color:var(--muted)}
   .charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px;margin-top:10px}
   .kpi{display:grid;grid-template-columns:1fr auto;gap:6px;padding:.6rem .8rem;border:1px solid #eee;border-radius:10px;background:#fbfbfb}
-  .bar{display:flex; gap:8px; align-items:center; flex-wrap:wrap}
-  .nowrap{white-space:nowrap}
-  @media print {
-    body{background:#fff}
-    .card{box-shadow:none;border:none}
-    .no-print{display:none !important}
-  }
 </style>
 
+<!-- Librerías para render bonito -->
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
 <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/dompurify@3.0.9/dist/purify.min.js"></script>
@@ -574,43 +444,38 @@ PORTAL_HTML = """
 </head>
 <body>
 <div class="card">
-  <div class="bar no-print">
-    <h2 style="margin:0;flex:1 1 auto">Portal de usuario (pase activo)</h2>
-    <button onclick="window.print()">🖨️ Imprimir reporte</button>
-  </div>
-  <div id="sessionbar" class="muted" style="margin:.4rem 0"></div>
+  <h2>Portal de usuario (pase activo)</h2>
 
   <!-- SUBIR PDFs -->
-  <form id="up" enctype="multipart/form-data" class="no-print" onsubmit="return false;">
-    <input id="fileInput" type="file" name="files" multiple accept="application/pdf">
+  <form id="up" method="post" enctype="multipart/form-data">
+    <input type="file" name="files" multiple accept="application/pdf" required>
     <small class="muted">Límites: máx <b>[MAX_FILES]</b> PDFs por subida · <b>[SINGLE_MAX] MB</b> cada uno · hasta <b>[TOTAL_MAX] MB</b> en total.</small>
-    <div class="bar" style="margin-top:8px">
-      <button id="btnUpload" type="button" onclick="doUpload()">Subir PDFs e indexar</button>
-      <small class="muted">También puedes seleccionar 1 archivo, subirlo, y repetir para agregar “uno a uno”.</small>
-    </div>
+    <div style="margin-top:8px"><button>Subir PDFs e indexar</button></div>
   </form>
   <pre id="upres"></pre>
 
   <!-- PREGUNTAS (hasta 5 a la vez) -->
-  <form id="askf" class="no-print">
+  <form id="askf">
     <textarea name="questions" rows="4" placeholder="Escribe hasta 5 preguntas, una por línea"></textarea>
-    <label class="nowrap" style="display:inline-flex;gap:6px;align-items:center;margin-top:8px">
+    <label style="display:inline-flex;gap:6px;align-items:center;margin-top:8px">
       <input type="checkbox" id="prosa"> Prosa premium (IA)
     </label>
     <div style="margin-top:8px"><button type="submit">Preguntar</button></div>
   </form>
   <div class="muted" style="margin:.4rem 0">Puedes hacer hasta 5 preguntas a la vez (una por línea).</div>
+  <!-- 👉 contenedor “bonito” para respuestas -->
   <div id="askres" class="md"></div>
 
-  <hr class="no-print" style="margin:18px 0">
+  <hr style="margin:18px 0">
 
   <!-- REPORTE -->
-  <form id="rep" class="no-print">
+  <form id="rep">
     <input name="periodo" placeholder="Período (opcional)">
     <small class="muted">Indica meses o años a evaluar. Ej: “2022–2024”, “ene–jun 2024”, “últimos 12 meses”.</small>
     <div style="margin-top:8px"><button>Generar Reporte Automático</button></div>
   </form>
 
+  <!-- 👉 contenedor “bonito” para reporte -->
   <div id="repres" class="md" style="margin-top:10px"></div>
   <div id="repcharts" class="charts"></div>
 </div>
@@ -619,41 +484,14 @@ PORTAL_HTML = """
 const MAX_FILES = [MAX_FILES];
 const SINGLE_MAX = [SINGLE_MAX]; // MB por archivo
 const TOTAL_MAX  = [TOTAL_MAX];  // MB por subida
-const up   = document.getElementById('up');
-const askf = document.getElementById('askf');
-const rep  = document.getElementById('rep');
-
-
-// --- Verificación de sesión al cargar ---
-(async function checkSession(){
-  try{
-    const r = await withToken('/me');
-    if(r.status!==200){ location.href='/'; return; }
-    const me = await r.json();
-    // Código + cuenta regresiva
-    const sb = document.getElementById('sessionbar');
-    const render = ()=> {
-      const mins = Math.floor(me.remaining_seconds/60);
-      const secs = me.remaining_seconds%60;
-      sb.textContent = `Código de sesión: ${me.code} · expira en ${mins}:${secs.toString().padStart(2,'0')}`;
-      if(me.remaining_seconds>0){ me.remaining_seconds--; setTimeout(render,1000); }
-      else { sb.textContent = "Sesión expirada. Vuelve a pagar o usar tu cupón." }
-    };
-    render();
-  }catch(e){ location.href='/'; }
-})();
 
 function toMB(n){ return (n/1024/1024).toFixed(1) + " MB"; }
 
-async function withToken(url, opts = {}) {
-  // Usamos la cookie 'token' (se setea sola en /mp/return o con cupón)
-  opts.credentials = 'include';
-  const baseHeaders = { Accept: 'application/json' };
-  // ⚠️ No mandamos Authorization para evitar problemas en Render
-  opts.headers = { ...baseHeaders, ...(opts.headers || {}) };
-  return fetch(url, opts);
+async function withToken(url,opts={}) {
+  const t = localStorage.getItem('token') || '';
+  opts.headers = Object.assign({'Authorization':'Bearer '+t}, opts.headers||{}, opts.headers);
+  return fetch(url,opts);
 }
-
 
 // ------ Render Markdown + Matemáticas + Gráficos ------
 function renderMD(el, md){
@@ -661,125 +499,62 @@ function renderMD(el, md){
     const raw = marked.parse(md || "");
     const clean = DOMPurify.sanitize(raw);
     el.innerHTML = clean;
-    try { renderMathInElement(el,{ delimiters:[
-      {left:"$$",right:"$$",display:true},{left:"$",right:"$",display:false}
-    ]}); } catch(e){}
-    // ```chart
+    // KaTeX
+    try {
+      renderMathInElement(el, {
+        delimiters: [
+          {left: "$$", right: "$$", display: true},
+          {left: "$",  right: "$",  display: false}
+        ]
+      });
+    } catch(e){}
+    // Bloques ```chart ...``` → Chart.js
     const blocks = el.querySelectorAll("pre code.language-chart");
-    blocks.forEach((code) => {
-      let cfg = null; try{ cfg = JSON.parse(code.textContent.trim()); }catch(e){ return; }
+    blocks.forEach((code, i) => {
+      const json = code.textContent.trim();
+      let cfg = null;
+      try { cfg = JSON.parse(json); } catch(e){ return; }
       const pre = code.closest("pre");
       const canvas = document.createElement("canvas");
       pre.replaceWith(canvas);
       new Chart(canvas.getContext('2d'), cfg);
     });
-  } catch(err) { el.textContent = "Error renderizando Markdown: " + err; }
+  } catch(err) {
+    el.textContent = "Error renderizando Markdown: " + err;
+  }
 }
-
-
-// --- Diagnóstico mínimo (muestra errores JS en pantalla) ---
-window.addEventListener('error', (e) => {
-  const box = document.getElementById('upres');
-  if (box) box.textContent = 'Error JS: ' + (e.message || (e.error && e.error.message) || 'desconocido');
-});
-document.getElementById('upres').textContent = 'JS cargó correctamente.';
-
 
 // ---------------- SUBIR PDFs ----------------
+up.onsubmit = async e => {
+  e.preventDefault();
+  const input = up.querySelector('input[type=file]');
+  const files = Array.from(input.files || []);
+  const box = document.getElementById('upres');
 
-// Elementos
-const fi    = document.getElementById('fileInput');
-const upBox = document.getElementById('upres');
-const btnU  = document.getElementById('btnUpload');
+  if (!files.length) { box.textContent = "Selecciona al menos un PDF."; return; }
+  if (files.length > MAX_FILES) { box.textContent = `Máximo ${MAX_FILES} PDFs por subida.`; return; }
 
-// Limites con fallback por si algo no se reemplazó
-const LIMITS = {
-  max:   Number(typeof MAX_FILES  !== 'undefined' ? MAX_FILES  : 5),
-  single:Number(typeof SINGLE_MAX !== 'undefined' ? SINGLE_MAX : 20),  // MB
-  total: Number(typeof TOTAL_MAX  !== 'undefined' ? TOTAL_MAX  : 100), // MB
-};
-
-// Validador común
-function validateFiles(files){
-  if (!files.length)         return { ok:false, msg:'Selecciona al menos un PDF.' };
-  if (files.length > LIMITS.max)
-                             return { ok:false, msg:`Máximo ${LIMITS.max} PDFs por subida.` };
   let total = 0;
-  for (const f of files){
+  for (const f of files) {
     total += f.size;
-    if (!/\.pdf$/i.test(f.name))                   return { ok:false, msg:`${f.name}: solo PDF` };
-    if (f.size > LIMITS.single*1024*1024)          return { ok:false, msg:`${f.name} supera ${LIMITS.single} MB (${toMB(f.size)})` };
+    if (!/\\.pdf$/i.test(f.name)) { box.textContent = `${f.name}: solo PDF`; return; }
+    if (f.size > SINGLE_MAX*1024*1024) { box.textContent = `${f.name} supera ${SINGLE_MAX} MB (${toMB(f.size)})`; return; }
   }
-  if (total > LIMITS.total*1024*1024)
-    return { ok:false, msg:`Superaste el total permitido (${LIMITS.total} MB). Estás subiendo ${toMB(total)}.` };
-  return { ok:true };
-}
-
-// Sólo validar al elegir (no sube todavía)
-fi?.addEventListener('change', () => {
-  const files = Array.from(fi.files || []);
-  const v = validateFiles(files);
-  if (!v.ok){ upBox.textContent = v.msg; fi.value = ''; return; }
-  upBox.textContent = `Listo: ${files.map(f=>f.name).join(', ')}. Ahora presiona “Subir PDFs e indexar”.`;
-});
-
-// Subir lo seleccionado
-async function doUpload(){
-  const files = Array.from(fi?.files || []);
-  const v = validateFiles(files);
-  if (!v.ok){
-    upBox.textContent = v.msg;
-    if (!files.length) fi?.click(); // abre selector si no hay archivos
+  if (total > TOTAL_MAX*1024*1024) {
+    box.textContent = `Superaste el total permitido (${TOTAL_MAX} MB). Subiste ${toMB(total)}.`;
     return;
   }
 
-  const fd = new FormData();
-  files.forEach(f => fd.append('files', f));
-
-  upBox.textContent = 'Subiendo…';
-  try{
-    const r   = await withToken('/upload', { method:'POST', body: fd });
-    const txt = await r.text();
-    let data; try{ data = JSON.parse(txt); } catch{ data = null; }
-
-    if (!r.ok || (data && data.ok === false)){
-      const msg = (data && (data.message || data.detail)) || txt || `Error HTTP ${r.status}`;
-      upBox.textContent = `Error subiendo archivos: ${msg}`;
-      return;
-    }
-
-    const names = (data?.saved || []).join(', ');
-    upBox.textContent = names
-      ? `Cargados: ${names}. Se están procesando en segundo plano.`
-      : 'Subida completa. Se están procesando en segundo plano.';
-    fi.value = ''; // limpiar selección
-
-    // ✅ NUEVO: consultar el estado del índice y mostrarlo
-    try {
-      const s = await withToken('/status');
-      if (s.ok) {
-        const st = await s.json();
-        upBox.textContent += `\nÍndice: ${st.fragments} fragmentos · ${st.docs} documento(s).`;
-      }
-    } catch (e) {
-      // si falla, lo ignoramos silenciosamente
-    }
-
-  }catch(err){
-    upBox.textContent = 'Error de red o sesión: ' + err;
-  }
-}
-
-// Botón y Enter del formulario
-document.getElementById('up')?.addEventListener('submit', (e) => { e.preventDefault(); doUpload(); });
-
-
+  const fd = new FormData(up);
+  const r  = await withToken('/upload',{method:'POST',body:fd});
+  box.textContent = `HTTP ${r.status}\\n` + await r.text();
+};
 
 // ---------------- PREGUNTAR ----------------
-document.getElementById('askf')?.addEventListener('submit', async (e) => {
+askf.onsubmit = async (e) => {
   e.preventDefault();
-  const raw = new FormData(document.getElementById('askf')).get('questions') || '';
-  const list = raw.split(/\r?\n/).map(s => s.trim()).filter(Boolean).slice(0, 5);
+  const raw = new FormData(askf).get('questions') || '';
+  const list = raw.split(/\\r?\\n/).map(s => s.trim()).filter(Boolean).slice(0, 5);
   const prosa = document.getElementById('prosa')?.checked || false;
 
   const box = document.getElementById('askres');
@@ -794,9 +569,10 @@ document.getElementById('askf')?.addEventListener('submit', async (e) => {
     });
     const data = await r.json();
 
+    // Construye HTML bonito
     let html = "";
     (data.results || []).forEach((it, idx) => {
-      const tag = it.prosa_premium ? '<span class="pill">Prosa premium (IA)</span>' : '';
+      const tag = it.prosa_premium ? '<span class="pill">prosa IA</span>' : '';
       html += `<h3>${idx+1}. ${it.question} ${tag}</h3><div id="ans_${idx}" class="md"></div>`;
       if (Array.isArray(it.sources) && it.sources.length){
         html += `<div class="src"><b>Fuentes:</b> ` +
@@ -804,19 +580,23 @@ document.getElementById('askf')?.addEventListener('submit', async (e) => {
           `</div>`;
       }
     });
-    box.innerHTML = DOMPurify.sanitize(html || "<div class='muted'>Sin resultados.</div>");
-    (data.results || []).forEach((it, idx) => renderMD(document.getElementById('ans_'+idx), it.answer_markdown || ""));
+    box.innerHTML = html || "<div class='muted'>Sin resultados.</div>";
+
+    // Render por ítem
+    (data.results || []).forEach((it, idx) => {
+      const el = document.getElementById('ans_'+idx);
+      renderMD(el, it.answer_markdown || "");
+    });
+
   } catch (err) {
     box.textContent = 'ERROR de red: ' + err;
   }
-});
-
+};
 
 // ---------------- REPORTE ----------------
-
-document.getElementById('rep')?.addEventListener('submit', async (e) => {
+rep.onsubmit = async e => {
   e.preventDefault();
-  const periodo = new FormData(document.getElementById('rep')).get('periodo') || '';
+  const periodo = new FormData(rep).get('periodo') || '';
   const repBox = document.getElementById('repres');
   const chartsBox = document.getElementById('repcharts');
   repBox.textContent = 'Generando…';
@@ -827,199 +607,44 @@ document.getElementById('rep')?.addEventListener('submit', async (e) => {
     headers:{'Content-Type':'application/json'},
     body: JSON.stringify({period: periodo})
   });
+
   const data = await r.json();
+  // Markdown del reporte
   renderMD(repBox, data.report_markdown || JSON.stringify(data,null,2));
 
-
-  // --- Datos base para todos los gráficos ---
+  // Gráficos rápidos a partir de KPIs si existen
   const k = data.kpis || {};
   const raw = (k.raw || {});
-  const byYear = (k.by_year || {});
-  const names = {
-    revenue:["Ingresos","Revenue"],
-    cogs:["Costo de ventas","COGS"],
-    gross_profit:["Utilidad bruta","Gross Profit"],
-    operating_income:["Resultado operacional (EBIT)","Operating Income"],
-    net_income:["Utilidad neta","Net Income"],
-    ebitda:["EBITDA","EBITDA"],
-    current_ratio:["Razón Corriente","Current Ratio"],
-    quick_ratio:["Prueba Ácida","Quick Ratio"],
-    gross_margin:["Margen Bruto","Gross Margin"],
-    operating_margin:["Margen Operacional","Operating Margin"],
-    net_margin:["Margen Neto","Net Margin"],
-    debt_ratio:["Deuda/Activos","Debt Ratio"],
-    debt_to_equity:["Deuda/Patrimonio","Debt to Equity"],
-    ROA:["ROA","Return on Assets"],
-    ROE:["ROE","Return on Equity"],
-    asset_turnover:["Rotación de Activos","Asset Turnover"]
-  };
+  const moneyKeys = ['revenue','cogs','gross_profit','operating_income','net_income','ebitda'];
+  const ratioKeys = ['gross_margin','operating_margin','net_margin','current_ratio','quick_ratio','debt_ratio','debt_to_equity','ROA','ROE','asset_turnover'];
 
-  function band(val, low, high, reverse=false){
-    if(val==null||isNaN(val)) return {label:"s/d", color:"#9ca3af"};
-    if(reverse){
-      if(high!=null && val>high) return {label:"Riesgo", color:"#ef4444"};
-      if(low!=null  && val>low)  return {label:"Medio", color:"#f59e0b"};
-      return {label:"Bueno", color:"#10b981"};
-    }else{
-      if(low!=null && val<low)   return {label:"Riesgo", color:"#ef4444"};
-      if(high!=null && val<high) return {label:"Medio", color:"#f59e0b"};
-      return {label:"Bueno", color:"#10b981"};
-    }
-  }
-  function kpisFlat(kobj){
-    const flat = Object.assign({}, kobj, kobj.raw||{});
-    delete flat.raw; return flat;
-  }
-
-  // 0) Tarjetas semáforo (didáctico)
-  (() => {
-    const flat = kpisFlat(k);
-    const thresholds = {
-      current_ratio:{low:1.0,high:1.5,reverse:false},
-      quick_ratio:{low:0.8,high:1.0,reverse:false},
-      gross_margin:{low:0.20,high:0.35,reverse:false},
-      operating_margin:{low:0.05,high:0.15,reverse:false},
-      net_margin:{low:0.03,high:0.10,reverse:false},
-      debt_ratio:{low:0.50,high:0.70,reverse:true},
-      debt_to_equity:{low:1.5,high:2.5,reverse:true},
-      interest_coverage:{low:1.5,high:3.0,reverse:false},
-      ROA:{low:0.03,high:0.07,reverse:false},
-      ROE:{low:0.10,high:0.20,reverse:false},
-      asset_turnover:{low:0.60,high:1.00,reverse:false},
-    };
-    const explain = {
-      current_ratio:"Liquidez de corto plazo (ideal ≥ 1,5).",
-      quick_ratio:"Liquidez exigente sin inventario (ideal ≥ 1,0).",
-      gross_margin:"Utilidad tras costo directo.",
-      operating_margin:"Eficiencia operativa.",
-      net_margin:"Utilidad final.",
-      debt_ratio:"Deuda sobre activos (bajo es mejor).",
-      debt_to_equity:"Deuda por cada peso de patrimonio.",
-      interest_coverage:"Veces que el EBIT cubre intereses.",
-      ROA:"Rentabilidad de los activos.",
-      ROE:"Rentabilidad del patrimonio.",
-      asset_turnover:"Eficiencia comercial vs activos."
-    };
-    const keys = Object.keys(thresholds).filter(k => flat[k] != null);
-    if(!keys.length) return;
-    const panel = document.createElement('div');
-    panel.style.display='grid';
-    panel.style.gridTemplateColumns='repeat(auto-fit,minmax(240px,1fr))';
-    panel.style.gap='12px';
-    keys.forEach(key=>{
-      const t = thresholds[key];
-      const b = band(flat[key], t.low, t.high, !!t.reverse);
-      const card = document.createElement('div');
-      card.className='kpi';
-      card.innerHTML = `
-        <div>
-          <div><b>${names[key][0]} / ${names[key][1]}</b></div>
-          <div class="muted">${explain[key]}</div>
-        </div>
-        <div class="pill" style="color:#fff;background:${b.color}">${b.label}</div>
-      `;
-      panel.appendChild(card);
-    });
-    chartsBox.appendChild(panel);
-  })();
-
-  // 1) Barras dinero (ES/EN)
-  (() => {
-    const keys = ['revenue','operating_income','net_income','ebitda'].filter(k=>raw[k]!=null);
-    if(keys.length<2) return;
-    const cv = document.createElement('canvas'); chartsBox.appendChild(cv);
-    new Chart(cv,{type:'bar',
-      data:{labels:keys.map(k=>names[k][0]+' / '+names[k][1]),
-            datasets:[{label:'$ (unidades del PDF)', data:keys.map(k=>raw[k]), backgroundColor:'#111'}]},
-      options:{plugins:{legend:{display:false}}, scales:{y:{beginAtZero:true}}}
-    });
-  })();
-
-  // 2) Donut composición
-  (() => {
-    if(raw.revenue!=null && raw.cogs!=null && raw.gross_profit!=null){
-      const cv = document.createElement('canvas'); chartsBox.appendChild(cv);
-      new Chart(cv,{type:'doughnut',
-        data:{labels:[names.revenue.join(' / '),names.cogs.join(' / '),names.gross_profit.join(' / ')],
-              datasets:[{data:[raw.revenue,raw.cogs,raw.gross_profit], backgroundColor:['#111','#6b7280','#10b981']}]},
-        options:{plugins:{title:{display:true,text:'Composición'}}}
-      });
-    }
-  })();
-
-  // 3) Radar de ratios
-  (() => {
-    const rkeys = ['gross_margin','operating_margin','net_margin','current_ratio','quick_ratio',
-                   'debt_ratio','debt_to_equity','ROA','ROE','asset_turnover'];
-    const flat = kpisFlat(k);
-    const keys = rkeys.filter(key => flat[key] != null);
-    if(!keys.length) return;
+  const mvals = moneyKeys.filter(k=>raw[k]!=null).map(k=>({k, v: raw[k]}));
+  if (mvals.length >= 2){
     const cv = document.createElement('canvas'); chartsBox.appendChild(cv);
     new Chart(cv, {
+      type:'bar',
+      data:{ labels:mvals.map(x=>x.k), datasets:[{label:'$ (unidades del PDF)', data:mvals.map(x=>x.v), backgroundColor:'#111'}]},
+      options:{plugins:{legend:{display:false}}, scales:{y:{beginAtZero:true}}}
+    });
+  }
+
+  const rvals = ratioKeys.filter(k=>k in kpisFlat(k)).map(k=>({k, v: kpisFlat(k)[k]}));
+  if (rvals.length){
+    const cv2 = document.createElement('canvas'); chartsBox.appendChild(cv2);
+    new Chart(cv2, {
       type:'radar',
-      data:{
-        labels: keys.map(key => names[key].join(' / ')),
-        datasets:[{
-          label:'Ratios',
-          data: keys.map(key => flat[key]),
-          backgroundColor:'rgba(17,17,17,.15)',
-          borderColor:'#111'
-        }]
-      },
+      data:{ labels:rvals.map(x=>x.k), datasets:[{label:'Ratios', data:rvals.map(x=>x.v), backgroundColor:'rgba(17,17,17,.15)', borderColor:'#111'}]},
       options:{scales:{r:{beginAtZero:true}}}
     });
-  })();
+  }
 
-  // 4) Línea por año
-  (() => {
-    const years = Object.keys(byYear).sort();
-    if(years.length<2) return;
-    const cv = document.createElement('canvas'); chartsBox.appendChild(cv);
-    const series = ['revenue','operating_income','net_income'].filter(k=>years.some(y=>byYear[y]?.raw?.[k]!=null));
-    const datasets = series.map((k,i)=>({
-      label:names[k].join(' / '),
-      data: years.map(y=>byYear[y]?.raw?.[k]||0),
-      borderColor:['#111','#0ea5e9','#10b981'][i%3],
-      tension:.2
-    }));
-    new Chart(cv,{type:'line',
-      data:{labels:years, datasets},
-      options:{plugins:{title:{display:true,text:'Evolución anual (extraída del PDF)'}}}
-    });
-  })();
-
-  // 5) Gauges: Liquidez, Apalancamiento, Cobertura intereses
-  (() => {
-    const flat = kpisFlat(k);
-    function gauge(value, target, title){
-      if(value==null || isNaN(value)) return;
-      const cv = document.createElement('canvas'); chartsBox.appendChild(cv);
-      const v = Math.max(0, Math.min(value, target));
-      new Chart(cv, {
-        type:'doughnut',
-        data:{ labels:['Valor','Resto'],
-          datasets:[{ data:[v, Math.max(0,target-v)], backgroundColor:['#10b981','#e5e7eb']}]
-        },
-        options:{ plugins:{title:{display:true, text:title}, legend:{display:false}},
-                  cutout:'70%', circumference:180, rotation:270 }
-      });
-    }
-    gauge(flat.current_ratio, 1.5, 'Liquidez (meta 1.5x)');
-    if(flat.debt_to_equity!=null){
-      const cv = document.createElement('canvas'); chartsBox.appendChild(cv);
-      const target = 2.0, val = Math.min(flat.debt_to_equity, target);
-      new Chart(cv, {
-        type:'doughnut',
-        data:{labels:['Dentro meta','Sobre meta'],
-          datasets:[{data:[Math.max(0,target-val), val], backgroundColor:['#10b981','#ef4444']}]},
-        options:{plugins:{title:{display:true,text:'Apalancamiento (meta ≤ 2,0)'}, legend:{display:false}},
-                 cutout:'70%', circumference:180, rotation:270}
-      });
-    }
-    gauge(flat.interest_coverage, 3.0, 'Cobertura intereses (meta 3x)');
-  })();
-
-
+  function kpisFlat(k){
+    // mezcla top-level + raw
+    const flat = Object.assign({}, k, k.raw||{});
+    delete flat.raw;
+    return flat;
+  }
+};
 </script>
 </body>
 </html>
@@ -1044,36 +669,19 @@ async def mp_create_preference(payload: Dict[str, str]):
     if not re.match(r"^[^@\s]+@gmail\.com$", gmail):
         raise HTTPException(400, "Debes usar un correo @gmail.com válido")
 
-    # --- Cupón (usa la tabla COUPONS) ---
-    price = float(settings.MP_PRICE_1DAY)         # precio base
-    c = COUPONS.get(coupon) if coupon else None   # busca el cupón en la tabla
-
-    # 1) Acceso GRATIS: no requiere MP
-    if c and c.get("type") == "free":
+    # --- Cupón propio ---
+    if coupon == "INVESTU-100":
+        # acceso gratis: generar token y NO pasar por Mercado Pago
         uid = make_user_id(gmail)
         ensure_dirs(user_dir(uid))
         token = make_token(uid, 24)
         return {"skip": True, "token": token}
 
-    # 2) Para el resto, ahora sí exigimos MP configurado
-    _require_mp()
+    # (opcional) descuento 50%
+    price = float(settings.MP_PRICE_1DAY)
+    if coupon == "INVESTU-50":
+        price = max(1.0, round(price * 0.5))
 
-    # 3) Descuento porcentual (si aplica) con decimales según moneda
-    #
-    # Estas líneas estaban desindentadas accidentalmente, quedando
-    # fuera del ámbito de la función. Esto ocasionaba que se
-    # ejecutaran a nivel de módulo o provocaran errores de
-    # indentación. Reindentamos el cálculo del descuento para que
-    # forme parte de la función y utilice correctamente las
-    # variables locales `price` y `c`.
-    decimals = _currency_decimals(settings.MP_CURRENCY)
-    if c and c.get("type") == "percent":
-        pct = float(c.get("value", 0))
-        price = max(1.0, round(price * (100 - pct) / 100, decimals))
-    # Asegura tipo float/decimal apropiado
-    price = float(price)
-
-    # 4) Preferencia MP
     preference = {
         "items": [{
             "title": f"Pase 1 día — {settings.APP_NAME}",
@@ -1099,14 +707,10 @@ async def mp_create_preference(payload: Dict[str, str]):
     except Exception as e:
         raise HTTPException(500, f"Mercado Pago error: {e}")
 
-def _currency_decimals(code: str) -> int:
-    # CLP/JPY sin decimales; resto 2 por defecto
-    return 0 if str(code).upper() in {"CLP","JPY","KRW"} else 2
-
 
 @app.get("/mp/return", response_class=HTMLResponse)
 async def mp_return(status: str | None = None, payment_id: str | None = None, collection_id: str | None = None):
-    _require_mp()
+    # Si auto_return=approved, vendrá con status=approved y payment_id
     pid = payment_id or collection_id
     if not pid:
         return HTMLResponse("<h3>No se recibió payment_id</h3>", status_code=400)
@@ -1132,35 +736,17 @@ async def mp_return(status: str | None = None, payment_id: str | None = None, co
     uid = make_user_id(gmail)
     ensure_dirs(user_dir(uid))
     token = make_token(uid, 24)
-
-    secure = "; Secure" if str(settings.BASE_URL).startswith("https://") else ""
-    html = f"""
-    <script>
-      localStorage.setItem('token', '{token}');
-      document.cookie = 'token={token}; Path=/; Max-Age=86400; SameSite=Lax{secure}';
-      location.href='/portal';
-    </script>
-    """
+    # Guardamos token en localStorage y vamos al portal
+    html = f"<script>localStorage.setItem('token','{token}'); location.href='/portal';</script>"
     return HTMLResponse(html)
 
-
-
 @app.get("/portal", response_class=HTMLResponse)
-async def portal(request: Request):
-    token = _get_token_from_request(request)
-    if not token:
-        return HTMLResponse("<script>location.href='/'</script>", status_code=401)
-    try:
-        read_token_full(token)  # valida y lanza 401 si expiró
-    except HTTPException:
-        return HTMLResponse("<script>location.href='/'</script>", status_code=401)
-
+async def portal():
     html = (PORTAL_HTML
             .replace("[MAX_FILES]", str(settings.MAX_UPLOAD_FILES))
             .replace("[SINGLE_MAX]", str(settings.SINGLE_FILE_MAX_MB))
             .replace("[TOTAL_MAX]", str(settings.MAX_TOTAL_MB)))
     return HTMLResponse(html)
-
 
 # (Opcional) Webhook para notificaciones asincrónicas
 # @app.post("/mp/webhook")
@@ -1170,6 +756,14 @@ async def portal(request: Request):
 #     return {"received": True}
 
 # ===================== Rutas protegidas =====================
+
+def require_user(request: Request) -> str:
+    auth = request.headers.get("Authorization", "")
+    if not auth.lower().startswith("bearer "):
+        raise HTTPException(401, "Falta token")
+    token = auth.split(" ",1)[1]
+    return read_token(token)
+
 
 def index_worker(base_dir: str, filenames: list[str]):
     """Se ejecuta en segundo plano: abre y agrega PDFs al índice."""
@@ -1183,13 +777,11 @@ def index_worker(base_dir: str, filenames: list[str]):
         print(f"[index_worker] ERROR: {e}", flush=True)
 
 
-from fastapi.responses import JSONResponse
-
 @app.post("/upload")
 async def upload(
     request: Request,
     background_tasks: BackgroundTasks,
-    files: List[UploadFile] = File(...),
+    files: Optional[List[UploadFile]] = File(None),
 ):
     uid = require_user(request)
     base = user_dir(uid); ensure_dirs(base)
@@ -1198,59 +790,41 @@ async def upload(
     single_max = settings.SINGLE_FILE_MAX_MB * 1024 * 1024
     total_max  = settings.MAX_TOTAL_MB * 1024 * 1024
 
-    # Si el cliente envía la solicitud sin archivos, FastAPI no llegará a
-    # este punto ya que `files` está marcado como obligatorio. Aun así,
-    # incluimos una verificación de seguridad para manejar listas vacías
-    # explícitamente.
-    if not files:
-        return JSONResponse({"ok": False, "message": "Selecciona al menos un PDF."}, status_code=400)
+    if not files or len(files) == 0:
+        return {"ok": False, "message": "Selecciona al menos un PDF."}
     if len(files) > max_files:
-        return JSONResponse({"ok": False, "message": f"Máximo {max_files} PDFs por subida."}, status_code=400)
+        return {"ok": False, "message": f"Máximo {max_files} PDFs por subida."}
 
     total_size = 0
     saved_names: List[str] = []
-
     for f in files:
-        # Nombre seguro
-        name = os.path.basename((f.filename or "archivo.pdf").strip())
+        name = (f.filename or "archivo.pdf").strip()
         if not name.lower().endswith(".pdf"):
-            return JSONResponse({"ok": False, "message": f"{name}: solo se aceptan PDF"}, status_code=400)
-
-        # Leemos el archivo
-        content = await f.read()
+            return {"ok": False, "message": f"{name}: solo se aceptan PDF"}
+        content = await f.read()                     # SOLO guardamos; nada pesado aquí
         total_size += len(content)
-
         if len(content) > single_max:
-            return JSONResponse({"ok": False, "message": f"{name}: supera {settings.SINGLE_FILE_MAX_MB} MB"}, status_code=413)
-
-        try:
-            with open(base/"docs"/name, "wb") as out:
-                out.write(content)
-        except Exception as e:
-            return JSONResponse({"ok": False, "message": f"No pude guardar {name}: {e}"}, status_code=500)
-
+            return {"ok": False, "message": f"{name}: supera {settings.SINGLE_FILE_MAX_MB} MB"}
+        with open(base/"docs"/name, "wb") as out:
+            out.write(content)
         saved_names.append(name)
 
-    # Límite total por subida
     if total_size > total_max:
         for nm in saved_names:
-            try:
-                (base/"docs"/nm).unlink(missing_ok=True)
-            except:
-                pass
-        return JSONResponse({"ok": False, "message": f"Superaste el total permitido ({settings.MAX_TOTAL_MB} MB por subida)."}, status_code=413)
+            try: (base/"docs"/nm).unlink(missing_ok=True)
+            except: pass
+        return {"ok": False, "message": f"Superaste el total permitido ({settings.MAX_TOTAL_MB} MB por subida)."}
 
-    # Indexación pesada en segundo plano
+    # 👉 La indexación pesada se hace en segundo plano (evita el 502/504)
     background_tasks.add_task(index_worker, str(base), saved_names)
 
-    # 👉 Siempre devolvemos JSON (sin redirecciones HTML)
-    return JSONResponse({
+    return {
         "ok": True,
         "saved": saved_names,
         "errors": [],
         "indexing": "in_progress",
         "note": "Estamos procesando tus PDFs en segundo plano."
-    }, status_code=200)
+    }
 
 
 @app.post("/upload-zip")
@@ -1262,26 +836,19 @@ async def upload_zip(request: Request, background_tasks: BackgroundTasks, file: 
         raise HTTPException(400, "Sube un .zip con PDFs")
 
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
-    try:
-        tmp.write(await file.read()); tmp.close()
+    tmp.write(await file.read()); tmp.close()
 
-        extracted = []
-        with ZipFile(tmp.name, 'r') as z:
-            for nm in z.namelist():
-                if nm.lower().endswith(".pdf"):
-                    dest = base/"docs"/Path(nm).name  # evita ZipSlip
-                    with z.open(nm) as src, open(dest, "wb") as out:
-                        shutil.copyfileobj(src, out)
-                    extracted.append(dest.name)
+    extracted = []
+    with ZipFile(tmp.name, 'r') as z:
+        for nm in z.namelist():
+            if nm.lower().endswith(".pdf"):
+                dest = base/"docs"/Path(nm).name
+                with z.open(nm) as src, open(dest, "wb") as out:
+                    shutil.copyfileobj(src, out)
+                extracted.append(dest.name)
 
-        background_tasks.add_task(index_worker, str(base), extracted)
-        return {"ok": True, "saved": extracted, "indexing": "in_progress"}
-    finally:
-        try:
-            os.unlink(tmp.name)
-        except Exception:
-            pass
-
+    background_tasks.add_task(index_worker, str(base), extracted)
+    return {"ok": True, "saved": extracted, "indexing": "in_progress"}
 
 @app.post("/ingest/url")
 async def ingest_from_urls(request: Request, background_tasks: BackgroundTasks, body: Dict[str, Any]):
@@ -1290,45 +857,19 @@ async def ingest_from_urls(request: Request, background_tasks: BackgroundTasks, 
     urls = body.get("urls") or []
     if not isinstance(urls, list) or not urls:
         raise HTTPException(400, "Incluye 'urls': [ ... ] con enlaces a PDFs")
-
-    max_mb = settings.SINGLE_FILE_MAX_MB
-    max_bytes = max_mb * 1024 * 1024
     saved = []
-
-    timeout = aiohttp.ClientTimeout(total=30)
-    async with aiohttp.ClientSession(timeout=timeout) as ses:
+    async with aiohttp.ClientSession() as ses:
         for u in urls:
-            u = str(u).strip()
-            if not u.lower().startswith(("http://", "https://")):
+            if not str(u).lower().endswith(".pdf"):
                 continue
-            fn = (base/"docs"/(Path(u).name or "archivo.pdf")).with_suffix(".pdf")
-            try:
-                async with ses.get(u, allow_redirects=True) as r:
-                    if r.status != 200:
-                        continue
-                    ctype = r.headers.get("Content-Type","").lower()
-                    if "pdf" not in ctype:
-                        continue
-                    # corta por Content-Length si existe
-                    cl = r.headers.get("Content-Length")
-                    if cl and int(cl) > max_bytes:
-                        continue
-                    # stream con tope
-                    read = 0
+            fn = base/"docs"/Path(u).name
+            async with ses.get(u) as r:
+                if r.status == 200:
                     with open(fn, "wb") as out:
-                        async for chunk in r.content.iter_chunked(64*1024):
-                            read += len(chunk)
-                            if read > max_bytes:
-                                raise HTTPException(413, f"Archivo supera {max_mb} MB")
-                            out.write(chunk)
+                        out.write(await r.read())
                     saved.append(fn.name)
-            except Exception:
-                # ignora URL con error; si prefieres, acumula en 'errors'
-                continue
-
-    if saved:
-        background_tasks.add_task(index_worker, str(base), saved)
-    return {"ok": True, "saved": saved, "indexing": "in_progress" if saved else "none"}
+    background_tasks.add_task(index_worker, str(base), saved)
+    return {"ok": True, "saved": saved, "indexing": "in_progress"}
 
 
 @app.get("/status")
@@ -1337,22 +878,6 @@ def status(request: Request):
     base = user_dir(uid)
     idx, meta = load_index(base)
     return {"fragments": idx.ntotal, "docs": len({m['doc_title'] for m in meta})}
-
-
-@app.get("/me")
-def me(request: Request):
-    token = _get_token_from_request(request)
-    if not token:
-        raise HTTPException(401, "Falta token")
-    data = read_token_full(token)
-    now = int(datetime.now(timezone.utc).timestamp())
-    remaining = max(0, data.get("exp", 0) - now)
-    return {
-        "uid": data.get("sub"),
-        "code": data.get("code"),
-        "exp": data.get("exp"),
-        "remaining_seconds": remaining
-    }
 
 
 import re as _re2
@@ -1520,36 +1045,23 @@ def rule_based_advice_from_kpis(k: dict) -> str:
 
     return "\n".join(out)
 
-
 def rule_based_advice_from_ctx(question: str, ctx: list[dict]) -> str:
     """
-    Usa pasajes (ctx) como evidencia y entrega explicación/diagnóstico simple,
-    con mini-resumen y notas por año si se detectan.
+    Usa pasajes (ctx) como evidencia y entrega explicación/diagnóstico simple
+    cuando no tenemos KPIs suficientes. Devuelve Markdown.
     """
     if not ctx:
         return "No hay suficiente evidencia en tus PDFs para responder esa pregunta."
 
-    import re as _reY
-    years = []
-    for c in ctx:
-        y = _reY.findall(r"\b(20\d{2})\b", (c.get("text") or ""))
-        years.extend(y)
-    years = sorted({y for y in years})
-
-    # Evidencia top-4
+    # Tomamos hasta 4 pasajes relevantes como 'evidencia'
     bullets = []
     for c in ctx[:4]:
-        doc = c.get("doc_title","?"); pg = c.get("page","?")
+        doc = c.get("doc_title","?")
+        pg  = c.get("page","?")
         tx  = (c.get("text","") or "").strip().replace("\n"," ")
-        if len(tx) > 300: tx = tx[:300] + "…"
+        if len(tx) > 300:
+            tx = tx[:300] + "…"
         bullets.append(f"- [{doc} p.{pg}] {tx}")
-
-    # Mini-resumen heurístico reutilizando summarize_answer
-    try:
-        res_like = [(c.get("score",0.0), c) for c in ctx]
-        resumen = summarize_answer(question, res_like)
-    except Exception:
-        resumen = ""
 
     md = []
     md.append("### Definiciones clave")
@@ -1558,29 +1070,14 @@ def rule_based_advice_from_ctx(question: str, ctx: list[dict]) -> str:
     md.append("- *Márgenes*: utilidad como % de ventas (bruto/operacional/neto).")
     md.append("- *Cobertura de intereses*: EBIT dividido por gastos financieros.")
 
-    if resumen:
-        md.append("\n" + resumen)
-
     md.append("\n### Diagnóstico (basado en evidencia)")
     md.append("Los pasajes más relevantes para tu pregunta son:")
     md += bullets
 
-    if years:
-        md.append("\n### Notas por año (detectado en texto)")
-        for y in years[:6]:
-            hits = []
-            for c in ctx[:10]:
-                t = (c.get("text","") or "")
-                if str(y) in t:
-                    frag = " ".join(t.split())[:220] + "…"
-                    hits.append(f"  - **{y}**: {frag}")
-                    if len(hits)>=2: break
-            md += hits
-
     md.append("\n### Recomendaciones (prioridad)")
-    md.append("- [P1] Capital de trabajo: acelerar cobros y optimizar inventarios según evidencia.")
+    md.append("- [P1] Revisa capital de trabajo: acelerar cobros y optimizar inventarios.")
     md.append("- [P2] Si el apalancamiento es alto, renegocia tasas/plazos y prioriza deuda cara.")
-    md.append("- [P3] Margen: precios/mix/mermas y eficiencia operativa.")
+    md.append("- [P3] Mejora margen: precios/mix/mermas y eficiencia operativa.")
 
     md.append("\n### Riesgos / alertas")
     md.append("- Concentración de clientes, variación de tasas/FX y dependencia de insumos.")
@@ -1654,34 +1151,6 @@ LABELS = {
     "ebitda": ["ebitda"],
 }
 
-NAMES = {
-    "revenue": ("Ingresos","Revenue"),
-    "cogs": ("Costo de ventas","COGS"),
-    "gross_profit": ("Utilidad bruta","Gross Profit"),
-    "operating_income": ("Resultado operacional (EBIT)","Operating Income"),
-    "net_income": ("Utilidad neta","Net Income"),
-    "total_assets": ("Activos totales","Total Assets"),
-    "total_equity": ("Patrimonio","Equity"),
-    "total_liabilities": ("Pasivos totales","Total Liabilities"),
-    "current_assets": ("Activos corrientes","Current Assets"),
-    "current_liabilities": ("Pasivos corrientes","Current Liabilities"),
-    "inventory": ("Inventario","Inventory"),
-    "accounts_receivable": ("Cuentas por cobrar","Accounts Receivable"),
-    "accounts_payable": ("Cuentas por pagar","Accounts Payable"),
-    "interest_expense": ("Gastos financieros","Interest Expense"),
-    "ebitda": ("EBITDA","EBITDA"),
-}
-
-GLOSARIO = {
-    "EBIT": "Earnings Before Interest and Taxes (Resultado de explotación).",
-    "EBITDA": "EBIT + Depreciación y Amortización.",
-    "COGS": "Cost of Goods Sold (Costo de ventas).",
-    "AV/AH": "Análisis Vertical / Horizontal.",
-    "CFO/CFI/CFF": "Flujos de Caja de Operación / Inversión / Financiamiento.",
-    "ROA": "Return on Assets (Utilidad/Activos).",
-    "ROE": "Return on Equity (Utilidad/Patrimonio)."
-}
-
 NUM = _re.compile(r"[-+]?\d{1,3}(?:[\.,]\d{3})*(?:[\.,]\d+)?")
 
 def _num(s: str):
@@ -1695,12 +1164,7 @@ def _num(s: str):
 
 def extract_kpis_from_pdfs(pdfs: List[Path]) -> Dict[str, Any]:
     import pdfplumber
-    from collections import defaultdict
-
     values: Dict[str, float] = {}
-    values_by_year: Dict[str, Dict[str, float]] = defaultdict(dict)
-    YR = _re.compile(r"\b(20\d{2})\b")  # ojo: raw string correcto
-
     for pdf in pdfs:
         try:
             with pdfplumber.open(pdf) as doc:
@@ -1708,99 +1172,61 @@ def extract_kpis_from_pdfs(pdfs: List[Path]) -> Dict[str, Any]:
                     text = page.extract_text() or ""
                     low = text.lower()
                     for key, keys in LABELS.items():
-                        for kw in keys:
-                            if kw in low:
+                        for k in keys:
+                            if k in low:
                                 for ln in text.splitlines():
-                                    if kw in ln.lower():
+                                    if k in ln.lower():
                                         v = _num(ln)
-                                        if v is None:
-                                            continue
-                                        # guarda primer valor visto
-                                        values.setdefault(key, v)
-                                        # intenta capturar año en la misma línea
-                                        m = YR.search(ln)
-                                        if m:
-                                            yr = m.group(1)
-                                            values_by_year[yr].setdefault(key, v)
+                                        if v is not None: values.setdefault(key, v)
         except Exception:
             continue
 
     out: Dict[str, Any] = {"raw": values}
 
-    # --------- Conveniencias (derivados globales) ----------
-    rev    = values.get("revenue")
-    cogs   = values.get("cogs")
-    gp     = values.get("gross_profit")
-    op     = values.get("operating_income")
-    ni     = values.get("net_income")
-    assets = values.get("total_assets")
-    eq     = values.get("total_equity")
-    liab   = values.get("total_liabilities")
-    ca     = values.get("current_assets")
-    cl     = values.get("current_liabilities")
-    inv    = values.get("inventory")
-    ar     = values.get("accounts_receivable")
-    ap     = values.get("accounts_payable")
-    intexp = values.get("interest_expense")
-    ebitda = values.get("ebitda")
+    # Conveniencias
+    rev   = values.get("revenue")
+    cogs  = values.get("cogs")
+    gp    = values.get("gross_profit")
+    op    = values.get("operating_income")
+    ni    = values.get("net_income")
+    assets= values.get("total_assets")
+    eq    = values.get("total_equity")
+    liab  = values.get("total_liabilities")
+    ca    = values.get("current_assets")
+    cl    = values.get("current_liabilities")
+    inv   = values.get("inventory")
+    ar    = values.get("accounts_receivable")
+    ap    = values.get("accounts_payable")
+    intexp= values.get("interest_expense")
+    ebitda= values.get("ebitda")
 
     # Márgenes
-    if rev and cogs: out["gross_margin"] = (rev - cogs) / rev
-    if op and rev:   out["operating_margin"] = op / rev
-    if ni and rev:   out["net_margin"] = ni / rev
+    if rev and cogs: out["gross_margin"]=(rev-cogs)/rev
+    if op and rev:   out["operating_margin"]=op/rev
+    if ni and rev:   out["net_margin"]=ni/rev
 
     # Liquidez
-    if ca and cl and cl != 0: out["current_ratio"] = ca / cl
-    if ca is not None and inv is not None and cl and cl != 0:
-        out["quick_ratio"] = (ca - inv) / cl
+    if ca and cl and cl!=0: out["current_ratio"]=ca/cl
+    if ca and inv is not None and cl and cl!=0: out["quick_ratio"]=(ca - inv)/cl
 
     # Endeudamiento
-    if liab and assets and assets != 0: out["debt_ratio"] = liab / assets
-    if liab and eq and eq != 0:         out["debt_to_equity"] = liab / eq
-    if op and intexp and intexp != 0:   out["interest_coverage"] = op / intexp
+    if liab and assets and assets!=0: out["debt_ratio"]=liab/assets
+    if liab and eq and eq!=0:         out["debt_to_equity"]=liab/eq
+    if op and intexp and intexp!=0:   out["interest_coverage"]=op/intexp
 
     # Rentabilidad
-    if ni and assets and assets != 0: out["ROA"] = ni / assets
-    if ni and eq and eq != 0:         out["ROE"] = ni / eq
-    if rev and assets and assets != 0: out["asset_turnover"] = rev / assets
+    if ni and assets and assets!=0: out["ROA"]=ni/assets
+    if ni and eq and eq!=0:         out["ROE"]=ni/eq
+    if rev and assets and assets!=0: out["asset_turnover"]=rev/assets
 
     # Actividad (días)
-    if rev and ar:   out["days_receivable"] = 365 * ar / rev
-    if cogs and ap:  out["days_payable"] = 365 * ap / cogs
-    if cogs and inv: out["inventory_turnover"] = cogs / max(inv, 1e-9)
+    if rev and ar:    out["days_receivable"]=365*ar/rev
+    if cogs and ap:   out["days_payable"]=365*ap/cogs
+    if cogs and inv:  out["inventory_turnover"]=cogs/max(inv,1e-9)
 
     # Working capital
-    if ca is not None and cl is not None:
-        out["working_capital"] = ca - cl
+    if ca is not None and cl is not None: out["working_capital"]=ca - cl
 
-    # --------- Derivados por año ----------
-    by_year: Dict[str, Any] = {}
-    for yr, vv in values_by_year.items():
-        yy = {"raw": vv}
-        rev    = vv.get("revenue");         cogs   = vv.get("cogs")
-        op     = vv.get("operating_income"); ni    = vv.get("net_income")
-        assets = vv.get("total_assets");     eq    = vv.get("total_equity")
-        liab   = vv.get("total_liabilities"); ca   = vv.get("current_assets")
-        cl     = vv.get("current_liabilities"); inv = vv.get("inventory")
-
-        if rev and cogs: yy["gross_margin"] = (rev - cogs) / rev
-        if op and rev:   yy["operating_margin"] = op / rev
-        if ni and rev:   yy["net_margin"] = ni / rev
-
-        if ca and cl and cl != 0: yy["current_ratio"] = ca / cl
-        if ca is not None and inv is not None and cl and cl != 0:
-            yy["quick_ratio"] = (ca - inv) / cl
-
-        if liab and assets and assets != 0: yy["debt_ratio"] = liab / assets
-        if liab and eq and eq != 0:         yy["debt_to_equity"] = liab / eq
-
-        if ni and assets and assets != 0: yy["ROA"] = ni / assets
-        if ni and eq and eq != 0:         yy["ROE"] = ni / eq
-        if rev and assets and assets != 0: yy["asset_turnover"] = rev / assets
-
-        by_year[yr] = yy
-
-    out["by_year"] = by_year
     return out
 
 
@@ -1822,13 +1248,9 @@ async def report(request: Request, body: Dict[str, Any]):
     lines.append(f"**Período**: {period or 'no especificado'}")
     lines.append("")
     lines.append("## 1) Resumen de KPIs")
-    for key in ["revenue","cogs","gross_profit","operating_income","net_income",
-                "total_assets","total_equity","total_liabilities","current_assets",
-                "current_liabilities","inventory","accounts_receivable",
-                "accounts_payable","ebitda","interest_expense","working_capital"]:
-        if key in k.get("raw", {}):
-            es, en = NAMES.get(key, (key, key))
-            lines.append(f"- {es} / {en}: {val(k['raw'][key])}")
+    for key in ["revenue","cogs","gross_profit","operating_income","net_income","total_assets","total_equity","total_liabilities","current_assets","current_liabilities","inventory","accounts_receivable","accounts_payable","ebitda","interest_expense","working_capital"]:
+        if key in k.get("raw",{}):
+            lines.append(f"- {key}: {val(k['raw'][key])}")
 
     lines.append("")
     lines.append("## 2) Márgenes")
@@ -1859,20 +1281,6 @@ async def report(request: Request, body: Dict[str, Any]):
     lines.append(f"- Días de Cuentas por Pagar: {k.get('days_payable','s/d')}")
     lines.append(f"- Rotación de Inventario (COGS/Inv): {k.get('inventory_turnover','s/d')}")
 
-    if k.get("by_year"):
-        lines.append("")
-        lines.append("## 6.1) KPIs por año (extraídos del PDF)")
-        years = sorted(k["by_year"].keys())
-        for y in years:
-            yy = k["by_year"][y]
-            lines.append(
-                f"- **{y}**: " + ", ".join(
-                    f"{NAMES.get(m,(m,m))[0]}: {val((yy.get('raw') or {}).get(m))}"
-                    for m in ["revenue","operating_income","net_income"]
-                    if (yy.get('raw') or {}).get(m) is not None
-                )
-            )
-
     lines.append("")
     lines.append("## 7) Flujo de Caja")
     lines.append("- Requiere estado de flujos para detalle. Si lo tienes, súbelo para estimar CFO/CFI/CFF y cobertura de caja.")
@@ -1898,38 +1306,6 @@ async def report(request: Request, body: Dict[str, Any]):
     lines.append("## 12) Tesorería (30/60/90)")
     lines.append("- Con antigüedad de saldos de clientes/proveedores, puedo construir el semáforo a 30/60/90.")
 
-    # --- 12.1) ¿Qué significa cada KPI? ---
-    EXPLAIN = {
-        "current_ratio": ("Razón Corriente", "Cuántas veces los activos de corto plazo alcanzan para pagar las deudas de corto plazo. Ideal ≥ 1,5."),
-        "quick_ratio": ("Prueba Ácida", "Igual que la razón corriente pero sin contar inventarios (más exigente). Ideal ≥ 1,0."),
-        "gross_margin": ("Margen Bruto", "Por cada $1 de ventas, cuánto queda tras el costo de los productos vendidos."),
-        "operating_margin": ("Margen Operacional", "Utilidad de la operación por cada $1 de ventas (sin considerar impuestos/financieros)."),
-        "net_margin": ("Margen Neto", "Utilidad final por cada $1 de ventas (después de todo)."),
-        "debt_ratio": ("Deuda/Activos", "Qué parte de los activos está financiada con deuda. Más bajo = mejor colchón."),
-        "debt_to_equity": ("Deuda/Patrimonio", "Cuántos pesos de deuda hay por cada peso de patrimonio. Más bajo reduce riesgo."),
-        "interest_coverage": ("Cobertura de Intereses", "Cuántas veces el EBIT cubre los intereses. Ideal ≥ 3."),
-        "ROA": ("ROA", "Rentabilidad de los activos: utilidad que generan los activos invertidos."),
-        "ROE": ("ROE", "Rentabilidad del patrimonio: utilidad para los dueños respecto a su inversión."),
-        "asset_turnover": ("Rotación de Activos", "Eficiencia comercial respecto al tamaño de los activos."),
-        "days_receivable": ("Días de Cobro", "En promedio, cuántos días demoras en cobrar a clientes."),
-        "days_payable": ("Días de Pago", "En promedio, cuántos días demoras en pagar a proveedores."),
-        "inventory_turnover": ("Rotación de Inventario", "Veces en el año que renuevas el inventario.")
-    }
-    lines.append("")
-    lines.append("## 12.1) ¿Qué significa cada KPI?")
-    for key, (title, note) in EXPLAIN.items():
-        val_show = k.get(key)
-        if key in ("gross_margin","operating_margin","net_margin","ROA","ROE","debt_ratio"):
-            val_fmt = pct(val_show)
-        else:
-            val_fmt = val_show if val_show is not None else "s/d"
-        lines.append(f"- **{title}**: {note} — *Valor detectado:* {val_fmt}")
-
-    lines.append("")
-    lines.append("## Glosario")
-    for kgl, vgl in GLOSARIO.items():
-        lines.append(f"- **{kgl}**: {vgl}")
-
     lines.append("")
     lines.append("## Conclusiones & Recomendaciones")
     tips = []
@@ -1943,12 +1319,12 @@ async def report(request: Request, body: Dict[str, Any]):
     lines += [f"- {t}" for t in tips]
 
     # ----- Resumen ejecutivo (opcional con GPT) -----
-    executive_summary = premium_exec_summary(period, k)  # None si no hay OPENAI_API_KEY
+    executive_summary = premium_exec_summary(period, k)  # devuelve None si no hay OPENAI_API_KEY
 
     result_md = "\n".join(lines)
     if executive_summary:
         result_md = "## Resumen Ejecutivo (IA)\n" + executive_summary + "\n\n" + result_md
-
+    
     # Añade diagnóstico local (definiciones + evaluación + recomendaciones)
     diag_md = rule_based_advice_from_kpis(k)
     if diag_md:
@@ -1967,16 +1343,13 @@ async def report(request: Request, body: Dict[str, Any]):
 @app.get("/__check_coupon")
 def __check_coupon():
     return {
-        "coupon_field_in_template": 'name="coupon"' in BASE_HTML
+        "coupon_field_in_template": "name=coupon" in BASE_HTML
     }
 
 
 @app.get("/health")
 async def health():
-    if SETTINGS_ERROR:
-        return PlainTextResponse(f"config error: {SETTINGS_ERROR}", status_code=500)
     return PlainTextResponse("ok", status_code=200)
-
 
 @app.get("/__version")
 def __version():
