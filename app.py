@@ -175,100 +175,133 @@ def read_meta(uid: str) -> Dict[str, Any]:
 
 # ===================== Frontend (HTML) =====================
 
-PORTAL_HTML = f"""
+# Usamos placeholders y reemplazos en lugar de f-strings para evitar
+# problemas con las llaves de JavaScript/CSS. Los valores dinámicos
+# (APP_NAME, límites) se sustituyen en portal_page.
+PORTAL_HTML_TEMPLATE = """
 <!doctype html>
-<html lang=es>
+<html lang="es">
 <head>
-<meta charset=utf-8>
-<meta name=viewport content="width=device-width, initial-scale=1">
-<title>{S.APP_NAME}</title>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>[APP_NAME]</title>
 <style>
- body{{font-family:system-ui,-apple-system,Segoe UI,Roboto;max-width:960px;margin:24px auto;padding:12px}}
- .card{{border:1px solid #ddd;border-radius:12px;padding:16px;margin:20px 0;background:#fff}}
- .btn{{background:#111;color:#fff;border:none;padding:10px 16px;border-radius:10px;cursor:pointer}}
- .nowrap{{white-space:nowrap;min-width:max-content}}
- #pending li{{margin:3px 0}}
- .muted{{color:#666}}
- .kpi{{padding:.75rem;border-radius:.75rem;border:1px solid #ddd}}
- .kpi.ok{{background:#e6ffed}}.kpi.warn{{background:#fff5cc}}.kpi.bad{{background:#ffe6e6}}
- @media print{{#printBtn,#uploadBtn,#pick,#pending,#askBtn,#genBtn,#msg,#qs{{display:none!important}}}}
+ body{{font-family:system-ui,-apple-system,Segoe UI,Roboto;max-width:960px;margin:24px auto;padding:12px;}}
+ .card{{border:1px solid #ddd;border-radius:12px;padding:16px;margin:20px 0;background:#fff;}}
+ .btn{{background:#111;color:#fff;border:none;padding:10px 16px;border-radius:10px;cursor:pointer;}}
+ .nowrap{{white-space:nowrap;min-width:max-content;}}
+ #pending li{{margin:3px 0;}}
+ .muted{{color:#666;}}
+ .kpi{{padding:.75rem;border-radius:.75rem;border:1px solid #ddd;}}
+ .kpi.ok{{background:#e6ffed;}} .kpi.warn{{background:#fff5cc;}} .kpi.bad{{background:#ffe6e6;}}
+ @media print{{#printBtn,#uploadBtn,#pick,#pending,#askBtn,#genBtn,#msg,#qs{{display:none!important;}}}}
 </style>
 </head>
 <body>
- <h2>{S.APP_NAME}</h2>
- <div class=card>
-   <button id=printBtn class=btn onclick="window.print()">🖨️ Imprimir reporte</button>
+ <h2>[APP_NAME]</h2>
+ <div class="card">
+   <button id="printBtn" class="btn" onclick="window.print()">🖨️ Imprimir reporte</button>
  </div>
- <div class=card>
-   <input id=pick type=file accept=application/pdf multiple>
-   <ul id=pending class=muted></ul>
-   <button id=uploadBtn class=btn>Subir PDFs e indexar</button>
-   <div id=msg class=muted></div>
-   <div><label class="nowrap"><input type=checkbox id=prosa> Prosa premium (IA)</label></div>
-   <small class=muted>* Máx {S.MAX_UPLOAD_FILES} PDFs por vez; {S.SINGLE_FILE_MAX_MB}MB por archivo; {S.MAX_TOTAL_MB}MB por subida.</small>
+ <div class="card">
+   <input id="pick" type="file" accept="application/pdf" multiple />
+   <ul id="pending" class="muted"></ul>
+   <button id="uploadBtn" class="btn">Subir PDFs e indexar</button>
+   <div id="msg" class="muted"></div>
+   <div><label class="nowrap"><input type="checkbox" id="prosa" /> Prosa premium (IA)</label></div>
+   <small class="muted">* Máx [MAX_FILES] PDFs por vez; [SINGLE_MAX]MB por archivo; [TOTAL_MAX]MB por subida.</small>
  </div>
- <div class=card>
+ <div class="card">
    <h3>Preguntar</h3>
-   <textarea id=qs rows=6 style="width:100%" placeholder="Escribe hasta 5 preguntas, una por línea"></textarea>
-   <button id=askBtn class=btn>Preguntar</button>
-   <pre id=ans style="white-space:pre-wrap"></pre>
+   <textarea id="qs" rows="6" style="width:100%" placeholder="Escribe hasta 5 preguntas, una por línea"></textarea>
+   <button id="askBtn" class="btn">Preguntar</button>
+   <pre id="ans" style="white-space:pre-wrap"></pre>
  </div>
- <div class=card>
+ <div class="card">
    <h3>Reporte Automático</h3>
-   <button id=genBtn class=btn>Generar Reporte Automático</button>
-   <div id=charts></div>
-   <div id=gloss></div>
+   <button id="genBtn" class="btn">Generar Reporte Automático</button>
+   <div id="charts"></div>
+   <div id="gloss"></div>
  </div>
  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
  <script>
   // Buffer para archivos
-  const pending=[];
-  const qsEl=document.getElementById('qs');
-  const ansEl=document.getElementById('ans');
-  const msgEl=document.getElementById('msg');
-  function renderPending(){
-    const ul=document.getElementById('pending');
-    ul.innerHTML = pending.map(p=>`<li>${p.name} <a href='#' data-n='${p.name}'>✖</a></li>`).join('');
-    ul.querySelectorAll('a').forEach(a=>{
-      a.onclick = e=>{
-        e.preventDefault(); const n=a.dataset.n; const i=pending.findIndex(p=>p.name===n);
-        if(i>=0) pending.splice(i,1); renderPending(); };
-    });
-  }
-  document.getElementById('pick').addEventListener('change', ()=>{
-    const fi=document.getElementById('pick');
-    for(const f of fi.files){ if(!pending.find(p=>p.name===f.name)) pending.push({file:f,name:f.name}); }
-    fi.value=''; renderPending();
-  });
-  function authHeader(){ const tok=localStorage.getItem('token') || ((document.cookie.match(/token=([^;]+)/)||[])[1]); return tok? {'Authorization':'Bearer '+tok} : {}; }
-  document.getElementById('uploadBtn').onclick = async ()=>{
-    if(!pending.length){ alert('No hay archivos para subir.'); return; }
-    const fd=new FormData(); pending.forEach(p=>fd.append('files',p.file));
-    const r=await fetch('/upload',{method:'POST',body:fd,headers:authHeader(),credentials:'include'});
-    const data=await r.json();
-    if(data.ok){ msgEl.textContent = data.message || ''; (data.saved||[]).forEach(nm=>{ const i=pending.findIndex(p=>p.name===nm); if(i>=0) pending.splice(i,1); }); renderPending(); }
-    else { msgEl.textContent = data.message || 'Error al subir.'; }
-  };
-  document.getElementById('askBtn').onclick=async ()=>{
-    const lines=qsEl.value.trim().split(/\n+/).filter(l=>l.trim()).slice(0,5);
-    if(!lines.length){ ansEl.textContent='Ingresa una o más preguntas.'; return; }
-    const r=await fetch('/ask',{method:'POST',headers:{'Content-Type':'application/json',...authHeader()},body:JSON.stringify({questions:lines})});
-    const data=await r.json(); ansEl.textContent = (data.answers||[]).join('\n\n');
-  };
-  document.getElementById('genBtn').onclick=async ()=>{
-    const r=await fetch('/auto-report',{headers:authHeader()}); const data=await r.json();
-    const charts=document.getElementById('charts'); charts.innerHTML='';
-    function addCanvas(){ const c=document.createElement('canvas'); charts.appendChild(c); return c; }
-    new Chart(addCanvas(),{type:'bar',data:{labels:data.years,datasets:[{label:'Ingresos / Revenue',data:data.revenue}]}});
-    new Chart(addCanvas(),{type:'line',data:{labels:data.years,datasets:[{label:'EBITDA (MM) / EBITDA',data:data.ebitda}]}});
-    new Chart(addCanvas(),{type:'line',data:{labels:data.years,datasets:[{label:'Margen EBITDA (%) / EBITDA Margin',data:data.margin}]}});
-    new Chart(addCanvas(),{type:'pie',data:{labels:['Fijos / Fixed','Variables / Variable','Otros / Other'],datasets:[{data:data.cost_mix}]}});
+  const pending = [];
+  const qsEl = document.getElementById('qs');
+  const ansEl = document.getElementById('ans');
+  const msgEl = document.getElementById('msg');
+  function renderPending(){{
+    const ul = document.getElementById('pending');
+    ul.innerHTML = pending.map(p => `<li>${{p.name}} <a href="#" data-n="${{p.name}}">✖</a></li>`).join('');
+    ul.querySelectorAll('a').forEach(a => {{
+      a.onclick = e => {{
+        e.preventDefault();
+        const n = a.dataset.n;
+        const i = pending.findIndex(p => p.name === n);
+        if (i >= 0) pending.splice(i,1);
+        renderPending();
+      }};
+    }});
+  }}
+  document.getElementById('pick').addEventListener('change', () => {{
+    const fi = document.getElementById('pick');
+    for (const f of fi.files) {{
+      if (!pending.find(p => p.name === f.name)) pending.push({{file: f, name: f.name}});
+    }}
+    fi.value = '';
+    renderPending();
+  }});
+  function authHeader(){{
+    const tok = localStorage.getItem('token') || ((document.cookie.match(/token=([^;]+)/) || [])[1]);
+    return tok ? {{ 'Authorization': 'Bearer ' + tok }} : {{}};
+  }}
+  document.getElementById('uploadBtn').onclick = async () => {{
+    if (!pending.length) {{ alert('No hay archivos para subir.'); return; }}
+    const fd = new FormData();
+    pending.forEach(p => fd.append('files', p.file));
+    const r = await fetch('/upload', {{ method: 'POST', body: fd, headers: authHeader(), credentials: 'include' }});
+    const data = await r.json();
+    if (data.ok) {{
+      msgEl.textContent = data.message || '';
+      (data.saved || []).forEach(nm => {{
+        const i = pending.findIndex(p => p.name === nm);
+        if (i >= 0) pending.splice(i, 1);
+      }});
+      renderPending();
+    }} else {{
+      msgEl.textContent = data.message || 'Error al subir.';
+    }}
+  }};
+  document.getElementById('askBtn').onclick = async () => {{
+    const lines = qsEl.value.trim().split(/\n+/).filter(l => l.trim()).slice(0,5);
+    if (!lines.length) {{ ansEl.textContent = 'Ingresa una o más preguntas.'; return; }}
+    const r = await fetch('/ask', {{ method: 'POST', headers: {{ 'Content-Type': 'application/json', ...authHeader() }}, body: JSON.stringify({{ questions: lines }}) }});
+    const data = await r.json();
+    ansEl.textContent = (data.answers || []).join('\n\n');
+  }};
+  document.getElementById('genBtn').onclick = async () => {{
+    const r = await fetch('/auto-report', {{ headers: authHeader() }});
+    const data = await r.json();
+    const charts = document.getElementById('charts');
+    charts.innerHTML = '';
+    function addCanvas(){{ const c = document.createElement('canvas'); charts.appendChild(c); return c; }}
+    new Chart(addCanvas(), {{ type: 'bar', data: {{ labels: data.years, datasets: [{{ label: 'Ingresos / Revenue', data: data.revenue }}] }} }});
+    new Chart(addCanvas(), {{ type: 'line', data: {{ labels: data.years, datasets: [{{ label: 'EBITDA (MM) / EBITDA', data: data.ebitda }}] }} }});
+    new Chart(addCanvas(), {{ type: 'line', data: {{ labels: data.years, datasets: [{{ label: 'Margen EBITDA (%) / EBITDA Margin', data: data.margin }}] }} }});
+    new Chart(addCanvas(), {{ type: 'pie', data: {{ labels: ['Fijos / Fixed','Variables / Variable','Otros / Other'], datasets: [{{ data: data.cost_mix }}] }} }});
     // KPIs
-    const kpiList=document.createElement('div'); charts.appendChild(kpiList);
-    (data.kpis||[]).forEach(k=>{ const div=document.createElement('div'); div.className='kpi '+k.state; div.innerHTML=`<b>${k.name_es} / ${k.name_en}:</b> ${k.value}${k.unit}<br><small>Fórmula: ${k.formula}</small><br><small>Estado: ${k.state==='ok'?'Bueno':k.state==='warn'?'Promedio':'Malo'}</small><br><small>Acción sugerida: ${k.action}</small>`; kpiList.appendChild(div); });
+    const kpiList = document.createElement('div');
+    charts.appendChild(kpiList);
+    (data.kpis || []).forEach(k => {{
+      const div = document.createElement('div');
+      div.className = 'kpi ' + k.state;
+      const estado = k.state === 'ok' ? 'Bueno' : k.state === 'warn' ? 'Promedio' : 'Malo';
+      div.innerHTML = `<b>${{k.name_es}} / ${{k.name_en}}:</b> ${{k.value}}${{k.unit}}<br><small>Fórmula: ${{k.formula}}</small><br><small>Estado: ${estado}</small><br><small>Acción sugerida: ${{k.action}}</small>`;
+      kpiList.appendChild(div);
+    }});
     // Glosario
-    const gl=document.getElementById('gloss'); gl.innerHTML='<h3>Glosario</h3><ul>'+ (data.glossary||[]).map(g=>`<li><b>${g.term}</b>: ${g.definition}</li>`).join('') + '</ul>';
-  };
+    const gl = document.getElementById('gloss');
+    gl.innerHTML = '<h3>Glosario</h3><ul>' + (data.glossary || []).map(g => `<li><b>${{g.term}}</b>: ${{g.definition}}</li>`).join('') + '</ul>';
+  }};
  </script>
 </body>
 </html>
@@ -279,8 +312,16 @@ PORTAL_HTML = f"""
 
 @app.get("/portal", response_class=HTMLResponse)
 def portal_page(request: Request, uid: str = Depends(require_user)):
-    """Devuelve el HTML del portal si el usuario está autenticado."""
-    return HTMLResponse(PORTAL_HTML)
+    """Devuelve el HTML del portal si el usuario está autenticado.
+
+    Sustituye los placeholders del template por los valores de configuración.
+    """
+    html = PORTAL_HTML_TEMPLATE
+    html = html.replace("[APP_NAME]", S.APP_NAME)
+    html = html.replace("[MAX_FILES]", str(S.MAX_UPLOAD_FILES))
+    html = html.replace("[SINGLE_MAX]", str(S.SINGLE_FILE_MAX_MB))
+    html = html.replace("[TOTAL_MAX]", str(S.MAX_TOTAL_MB))
+    return HTMLResponse(html)
 
 
 @app.post("/upload")
