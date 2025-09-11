@@ -646,11 +646,10 @@ const rep  = document.getElementById('rep');
 function toMB(n){ return (n/1024/1024).toFixed(1) + " MB"; }
 
 async function withToken(url, opts = {}) {
-  const t = localStorage.getItem('token') || '';
+  // Usamos la cookie 'token' (se setea sola en /mp/return o con cupón)
   opts.credentials = 'include';
-  // 👉 Siempre pedimos JSON para que el backend no intente devolver HTML
   const baseHeaders = { Accept: 'application/json' };
-  if (t) baseHeaders.Authorization = 'Bearer ' + t;
+  // ⚠️ No mandamos Authorization para evitar problemas en Render
   opts.headers = { ...baseHeaders, ...(opts.headers || {}) };
   return fetch(url, opts);
 }
@@ -1177,6 +1176,8 @@ def index_worker(base_dir: str, filenames: list[str]):
         print(f"[index_worker] ERROR: {e}", flush=True)
 
 
+from fastapi.responses import JSONResponse
+
 @app.post("/upload")
 async def upload(
     request: Request,
@@ -1191,65 +1192,54 @@ async def upload(
     total_max  = settings.MAX_TOTAL_MB * 1024 * 1024
 
     if not files or len(files) == 0:
-        return {"ok": False, "message": "Selecciona al menos un PDF."}
+        return JSONResponse({"ok": False, "message": "Selecciona al menos un PDF."}, status_code=400)
     if len(files) > max_files:
-        return {"ok": False, "message": f"Máximo {max_files} PDFs por subida."}
+        return JSONResponse({"ok": False, "message": f"Máximo {max_files} PDFs por subida."}, status_code=400)
 
     total_size = 0
     saved_names: List[str] = []
 
     for f in files:
-        # Nombre seguro (evita rutas tipo ../../algo.pdf)
+        # Nombre seguro
         name = os.path.basename((f.filename or "archivo.pdf").strip())
         if not name.lower().endswith(".pdf"):
-            return {"ok": False, "message": f"{name}: solo se aceptan PDF"}
+            return JSONResponse({"ok": False, "message": f"{name}: solo se aceptan PDF"}, status_code=400)
 
-        # Leemos el archivo (en memoria). Si prefieres stream, se puede ajustar.
+        # Leemos el archivo
         content = await f.read()
         total_size += len(content)
 
         if len(content) > single_max:
-            return {"ok": False, "message": f"{name}: supera {settings.SINGLE_FILE_MAX_MB} MB"}
+            return JSONResponse({"ok": False, "message": f"{name}: supera {settings.SINGLE_FILE_MAX_MB} MB"}, status_code=413)
 
         try:
-            # ←← **AQUÍ estaba la indentación mal**
             with open(base/"docs"/name, "wb") as out:
                 out.write(content)
         except Exception as e:
-            raise HTTPException(500, f"No pude guardar {name}: {e}")
+            return JSONResponse({"ok": False, "message": f"No pude guardar {name}: {e}"}, status_code=500)
 
         saved_names.append(name)
 
-        # Límite total por subida: si se excede, deshacemos lo guardado
+    # Límite total por subida
     if total_size > total_max:
         for nm in saved_names:
             try:
                 (base/"docs"/nm).unlink(missing_ok=True)
             except:
                 pass
-        return {"ok": False, "message": f"Superaste el total permitido ({settings.MAX_TOTAL_MB} MB por subida)."}
+        return JSONResponse({"ok": False, "message": f"Superaste el total permitido ({settings.MAX_TOTAL_MB} MB por subida)."}, status_code=413)
 
-    # Indexación pesada en segundo plano (evita timeouts)
+    # Indexación pesada en segundo plano
     background_tasks.add_task(index_worker, str(base), saved_names)
 
-    # Respuesta estándar para fetch (JSON)
-    resp = {
+    # 👉 Siempre devolvemos JSON (sin redirecciones HTML)
+    return JSONResponse({
         "ok": True,
         "saved": saved_names,
         "errors": [],
         "indexing": "in_progress",
         "note": "Estamos procesando tus PDFs en segundo plano."
-    }
-
-
-    # Parachoques: si la petición vino esperando HTML (submit tradicional),
-    # redirige al portal para que no se quede viendo el JSON.
-    accept = (request.headers.get("accept") or "").lower()
-    if "text/html" in accept and "application/json" not in accept:
-        return RedirectResponse(url="/portal", status_code=303)
-
-    # Para fetch: devuelve JSON
-    return resp
+    }, status_code=200)
 
 
 @app.post("/upload-zip")
