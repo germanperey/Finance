@@ -1059,12 +1059,19 @@ async def mp_create_preference(payload: Dict[str, str]):
     _require_mp()
 
     # 3) Descuento porcentual (si aplica) con decimales según moneda
-decimals = _currency_decimals(settings.MP_CURRENCY)
-if c and c.get("type") == "percent":
-    pct = float(c.get("value", 0))
-    price = max(1.0, round(price * (100 - pct) / 100, decimals))
-# Asegura tipo float/decimal apropiado
-price = float(price)
+    #
+    # Estas líneas estaban desindentadas accidentalmente, quedando
+    # fuera del ámbito de la función. Esto ocasionaba que se
+    # ejecutaran a nivel de módulo o provocaran errores de
+    # indentación. Reindentamos el cálculo del descuento para que
+    # forme parte de la función y utilice correctamente las
+    # variables locales `price` y `c`.
+    decimals = _currency_decimals(settings.MP_CURRENCY)
+    if c and c.get("type") == "percent":
+        pct = float(c.get("value", 0))
+        price = max(1.0, round(price * (100 - pct) / 100, decimals))
+    # Asegura tipo float/decimal apropiado
+    price = float(price)
 
     # 4) Preferencia MP
     preference = {
@@ -1182,7 +1189,7 @@ from fastapi.responses import JSONResponse
 async def upload(
     request: Request,
     background_tasks: BackgroundTasks,
-    files: Optional[List[UploadFile]] = File(None),
+    files: List[UploadFile] = File(...),
 ):
     uid = require_user(request)
     base = user_dir(uid); ensure_dirs(base)
@@ -1191,7 +1198,11 @@ async def upload(
     single_max = settings.SINGLE_FILE_MAX_MB * 1024 * 1024
     total_max  = settings.MAX_TOTAL_MB * 1024 * 1024
 
-    if not files or len(files) == 0:
+    # Si el cliente envía la solicitud sin archivos, FastAPI no llegará a
+    # este punto ya que `files` está marcado como obligatorio. Aun así,
+    # incluimos una verificación de seguridad para manejar listas vacías
+    # explícitamente.
+    if not files:
         return JSONResponse({"ok": False, "message": "Selecciona al menos un PDF."}, status_code=400)
     if len(files) > max_files:
         return JSONResponse({"ok": False, "message": f"Máximo {max_files} PDFs por subida."}, status_code=400)
