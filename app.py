@@ -818,9 +818,28 @@ def warmup() -> JSONResponse:
     """Endpoint de prueba para readiness."""
     return JSONResponse({"ok": True})
 
+
 # --- Health checks (Render) ---
 @app.get("/health")
 def health():
     # simple 200 con JSON
     return {"ok": True}
 
+
+from fastapi.responses import RedirectResponse, HTMLResponse
+
+@app.get("/", include_in_schema=False)
+def root(request: Request):
+    token = request.cookies.get("token") or request.headers.get("Authorization", "").replace("Bearer ","").strip()
+    if token:
+        return RedirectResponse(url="/portal", status_code=307)
+    return HTMLResponse("""
+    <html><body style="font-family:system-ui;padding:24px">
+      <h2>Asesor Financiero</h2>
+      <p>Servicio activo. Opciones:</p>
+      <ul>
+        <li><a href="/health">/health</a> (estado del servicio)</li>
+        <li>/portal (requiere token)</li>
+      </ul>
+    </body></html>
+    """)
