@@ -845,6 +845,38 @@ def root(request: Request):
     """)
 
 
+# --- utilidades de depuración ---
+# Estos endpoints permiten inspeccionar el estado de autenticación actual
+# y limpiar la cookie de sesión.  Se incluyen fuera del esquema Swagger
+# porque se consideran auxiliares y, en entornos de producción, deben
+# estar deshabilitados via DEV_ALLOW_TOKEN=0.
+
+@app.get("/whoami")
+def whoami(request: Request):
+    """Devuelve el UID del token actual o un error si no hay autenticación."""
+    try:
+        uid = require_user(request)
+        return {"ok": True, "uid": uid}
+    except HTTPException as e:
+        return JSONResponse({"ok": False, "detail": e.detail}, status_code=e.status_code)
+
+
+@app.get("/dev/logout", include_in_schema=False)
+def dev_logout():
+    """Elimina la cookie de autenticación y sugiere limpiar localStorage."""
+    html = """
+    <html><body style="font-family:system-ui;padding:24px">
+      <h3>Has salido</h3>
+      <p>Se borró la cookie <code>token</code>. Si guardaste un token en <code>localStorage</code>, bórralo con:</p>
+      <pre>localStorage.removeItem('token')</pre>
+      <p><a href="/">Volver al inicio</a></p>
+    </body></html>
+    """
+    resp = HTMLResponse(html)
+    resp.delete_cookie("token", path="/")
+    return resp
+
+
 # ========= Utilidades DEV para emitir/colocar token (desactivar en prod) =========
 from fastapi.responses import RedirectResponse
 
@@ -867,7 +899,8 @@ async def dev_make_token(req: Request):
 
     exp = int((datetime.now(timezone.utc) + timedelta(hours=24)).timestamp())
     payload = {"uid": uid, "exp": exp}
-    token = jwt.encode(payload, S.JWT_SECRET, algorithm="HS256")
+    # Utiliza la clave JWT definida en settings para firmar el token
+    token = jwt.encode(payload, settings.JWT_SECRET, algorithm="HS256")
     return {"token": token, "uid": uid, "exp": exp}
 
 @app.get("/dev/login")
@@ -883,7 +916,8 @@ def dev_login(gmail: str = "demo@example.com"):
     uid = hashlib.sha256(gmail.encode()).hexdigest()[:16]
     exp = int((datetime.now(timezone.utc) + timedelta(hours=24)).timestamp())
     payload = {"uid": uid, "exp": exp}
-    token = jwt.encode(payload, S.JWT_SECRET, algorithm="HS256")
+    # Firma el token con settings.JWT_SECRET para que sea compatible con require_user
+    token = jwt.encode(payload, settings.JWT_SECRET, algorithm="HS256")
 
     resp = RedirectResponse(url="/portal", status_code=307)
     # cookie simple para que el frontend y el backend la lean
