@@ -137,29 +137,60 @@ def _user_dir(uid: str) -> Path:
 
 
 def _get_token(request: Request) -> Optional[str]:
-    """Extrae el token JWT del encabezado Authorization o de las cookies."""
+    """Extrae el token JWT del encabezado Authorization o de las cookies.
+
+    Este helper es tolerante con valores que contienen el prefijo ``Bearer``
+    tanto en el encabezado como en la cookie.  Si no se encuentra un
+    token válido, devuelve ``None``.
+    """
+    # Primero intenta a partir del encabezado Authorization
     auth = request.headers.get("Authorization", "")
-    if auth.lower().startswith("bearer "):
-        return auth.split(" ", 1)[1].strip()
-    return request.cookies.get("token")
+    if auth:
+        # Acepta tanto "Bearer <token>" como sólo el token
+        if auth.lower().startswith("bearer "):
+            token = auth.split(" ", 1)[1].strip()
+        else:
+            token = auth.strip()
+        if token:
+            return token
+    # Luego revisa la cookie "token"
+    cookie_token = request.cookies.get("token")
+    if cookie_token:
+        # Algunos clientes podrían almacenar "Bearer ..." en la cookie
+        t = cookie_token.strip()
+        if t.lower().startswith("bearer "):
+            t = t.split(" ", 1)[1].strip()
+        return t or None
+    return None
 
 
 def require_user(request: Request) -> str:
-    """Valida el token JWT y devuelve el UID.  Lanza 401 si es inválido."""
+    """
+    Valida el token JWT y devuelve el UID.
+
+    Este validador acepta tokens enviados por encabezado ``Authorization: Bearer`` o
+    por cookie ``token``. Se permite una pequeña tolerancia de reloj (60 segundos)
+    al verificar la expiración para reducir errores por desfase horario.  Si el
+    token no está presente, está expirado o no contiene un ``uid`` válido,
+    se devuelve un error 401 con un mensaje explícito.
+    """
     token = _get_token(request)
     if not token:
-        raise HTTPException(401, "No autenticado")
+        raise HTTPException(status_code=401, detail="No autenticado")
     try:
-        data = jwt.decode(token, settings.JWT_SECRET, algorithms=["HS256"])
-        uid = data.get("uid")
-        exp = data.get("exp")
-        if exp and datetime.now(timezone.utc).timestamp() > float(exp):
-            raise HTTPException(401, "Token expirado")
-        if not uid:
-            raise HTTPException(401, "Token inválido")
-        return str(uid)
-    except JWTError:
-        raise HTTPException(401, "Token inválido")
+        data = jwt.decode(
+            token,
+            settings.JWT_SECRET,
+            algorithms=["HS256"],
+            options={"verify_signature": True, "verify_exp": True},
+            leeway=60,
+        )
+    except JWTError as exc:
+        raise HTTPException(status_code=401, detail=f"Token inválido: {str(exc)}")
+    uid = data.get("uid")
+    if not uid:
+        raise HTTPException(status_code=401, detail="Token inválido: falta 'uid'")
+    return str(uid)
 
 
 # Expresión regular para detectar años completos de cuatro dígitos; usamos
@@ -845,38 +876,6 @@ def root(request: Request):
     """)
 
 
-# --- utilidades de depuración ---
-# Estos endpoints permiten inspeccionar el estado de autenticación actual
-# y limpiar la cookie de sesión.  Se incluyen fuera del esquema Swagger
-# porque se consideran auxiliares y, en entornos de producción, deben
-# estar deshabilitados via DEV_ALLOW_TOKEN=0.
-
-@app.get("/whoami")
-def whoami(request: Request):
-    """Devuelve el UID del token actual o un error si no hay autenticación."""
-    try:
-        uid = require_user(request)
-        return {"ok": True, "uid": uid}
-    except HTTPException as e:
-        return JSONResponse({"ok": False, "detail": e.detail}, status_code=e.status_code)
-
-
-@app.get("/dev/logout", include_in_schema=False)
-def dev_logout():
-    """Elimina la cookie de autenticación y sugiere limpiar localStorage."""
-    html = """
-    <html><body style="font-family:system-ui;padding:24px">
-      <h3>Has salido</h3>
-      <p>Se borró la cookie <code>token</code>. Si guardaste un token en <code>localStorage</code>, bórralo con:</p>
-      <pre>localStorage.removeItem('token')</pre>
-      <p><a href="/">Volver al inicio</a></p>
-    </body></html>
-    """
-    resp = HTMLResponse(html)
-    resp.delete_cookie("token", path="/")
-    return resp
-
-
 # ========= Utilidades DEV para emitir/colocar token (desactivar en prod) =========
 from fastapi.responses import RedirectResponse
 
@@ -899,7 +898,7 @@ async def dev_make_token(req: Request):
 
     exp = int((datetime.now(timezone.utc) + timedelta(hours=24)).timestamp())
     payload = {"uid": uid, "exp": exp}
-    # Utiliza la clave JWT definida en settings para firmar el token
+    # Firmamos el token usando la clave de configuración (settings.JWT_SECRET) en lugar de S
     token = jwt.encode(payload, settings.JWT_SECRET, algorithm="HS256")
     return {"token": token, "uid": uid, "exp": exp}
 
@@ -916,10 +915,73 @@ def dev_login(gmail: str = "demo@example.com"):
     uid = hashlib.sha256(gmail.encode()).hexdigest()[:16]
     exp = int((datetime.now(timezone.utc) + timedelta(hours=24)).timestamp())
     payload = {"uid": uid, "exp": exp}
-    # Firma el token con settings.JWT_SECRET para que sea compatible con require_user
+    # Firmamos el token usando la clave de configuración (settings.JWT_SECRET) en lugar de S
     token = jwt.encode(payload, settings.JWT_SECRET, algorithm="HS256")
 
     resp = RedirectResponse(url="/portal", status_code=307)
     # cookie simple para que el frontend y el backend la lean
     resp.set_cookie("token", token, max_age=24*3600, path="/")
     return resp
+
+@app.get("/whoami")
+def whoami(request: Request):
+    """
+    Devuelve el UID del usuario autenticado si el token es válido.
+    De lo contrario, devuelve un objeto indicando que la autenticación falló.
+    Este endpoint es útil para depurar el estado de la sesión.
+    """
+    try:
+        uid = require_user(request)
+        return {"ok": True, "uid": uid}
+    except HTTPException as e:
+        return JSONResponse({"ok": False, "detail": e.detail}, status_code=e.status_code)
+
+@app.get("/dev/logout", include_in_schema=False)
+def dev_logout():
+    """
+    Borra la cookie ``token`` para cerrar la sesión en el navegador.
+    Muestra además instrucciones para eliminar cualquier token almacenado
+    en localStorage del lado del cliente.  Sólo para uso en desarrollo.
+    """
+    html = """
+    <html><body style="font-family:system-ui;padding:24px">
+      <h3>Sesión cerrada</h3>
+      <p>Se borró la cookie <code>token</code>. Si guardaste un token en
+      <code>localStorage</code>, bórralo ejecutando:</p>
+      <pre>localStorage.removeItem('token')</pre>
+      <p><a href="/">Volver al inicio</a></p>
+    </body></html>
+    """
+    resp = HTMLResponse(html)
+    resp.delete_cookie("token", path="/")
+    return resp
+
+@app.get("/dev/diag")
+def dev_diag(request: Request):
+    """
+    Endpoint de diagnóstico que muestra información sobre el secreto configurado
+    (sin exponerlo) y el token actual.  Sólo debe utilizarse durante el
+    desarrollo para depurar problemas de autenticación.
+    Requiere DEV_ALLOW_TOKEN=1.
+    """
+    info: Dict[str, Any] = {}
+    # Mostrar si existe JWT_SECRET y un fingerprint parcial
+    has_secret = bool(settings.JWT_SECRET)
+    secret_fingerprint = hashlib.sha256(settings.JWT_SECRET.encode()).hexdigest()[:12] if has_secret else "missing"
+    info["has_secret"] = has_secret
+    info["secret_fp"] = secret_fingerprint
+    token = _get_token(request)
+    info["has_token"] = bool(token)
+    if token:
+        try:
+            # Extraer el algoritmo del header sin verificar la firma
+            hdr = jwt.get_unverified_header(token)
+            info["token_alg"] = hdr.get("alg")
+        except Exception as e:
+            info["token_alg"] = f"unknown ({e})"
+        try:
+            payload = jwt.get_unverified_claims(token)
+            info["token_claims"] = {k: payload.get(k) for k in ("uid", "exp")}
+        except Exception as e:
+            info["token_claims"] = f"unavailable ({e})"
+    return info
