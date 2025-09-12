@@ -843,3 +843,49 @@ def root(request: Request):
       </ul>
     </body></html>
     """)
+
+
+# ========= Utilidades DEV para emitir/colocar token (desactivar en prod) =========
+from fastapi.responses import RedirectResponse
+
+def dev_tokens_enabled() -> bool:
+    return os.getenv("DEV_ALLOW_TOKEN", "0") == "1"
+
+@app.post("/dev/make-token")
+async def dev_make_token(req: Request):
+    """
+    Devuelve un token JWT válido para el portal.
+    Requiere DEV_ALLOW_TOKEN=1 en variables de entorno.
+    Body JSON: {"gmail": "tucorreo@gmail.com"}
+    """
+    if not dev_tokens_enabled():
+        raise HTTPException(403, "Dev tokens deshabilitados")
+
+    data = await req.json()
+    gmail = (data.get("gmail") or "demo@example.com").lower()
+    uid = hashlib.sha256(gmail.encode()).hexdigest()[:16]
+
+    exp = int((datetime.now(timezone.utc) + timedelta(hours=24)).timestamp())
+    payload = {"uid": uid, "exp": exp}
+    token = jwt.encode(payload, S.JWT_SECRET, algorithm="HS256")
+    return {"token": token, "uid": uid, "exp": exp}
+
+@app.get("/dev/login")
+def dev_login(gmail: str = "demo@example.com"):
+    """
+    Genera un token y lo guarda en cookie `token` y redirige a /portal.
+    Útil para probar en el navegador sin tocar headers.
+    """
+    if not dev_tokens_enabled():
+        raise HTTPException(403, "Dev tokens deshabilitados")
+
+    gmail = gmail.lower()
+    uid = hashlib.sha256(gmail.encode()).hexdigest()[:16]
+    exp = int((datetime.now(timezone.utc) + timedelta(hours=24)).timestamp())
+    payload = {"uid": uid, "exp": exp}
+    token = jwt.encode(payload, S.JWT_SECRET, algorithm="HS256")
+
+    resp = RedirectResponse(url="/portal", status_code=307)
+    # cookie simple para que el frontend y el backend la lean
+    resp.set_cookie("token", token, max_age=24*3600, path="/")
+    return resp
