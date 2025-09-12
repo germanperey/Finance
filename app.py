@@ -817,3 +817,10 @@ async def mp_create_preference(request: Request) -> JSONResponse:
 def warmup() -> JSONResponse:
     """Endpoint de prueba para readiness."""
     return JSONResponse({"ok": True})
+
+# --- Health checks (Render) ---
+@app.get("/health")
+def health():
+    # simple 200 con JSON
+    return {"ok": True}
+
